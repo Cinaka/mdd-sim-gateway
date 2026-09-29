@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from control.app import config, operations
 
@@ -17,6 +17,46 @@ except ImportError:      # the Docker SDK is a manager runtime dependency this d
 
 
 class OperationsTests(unittest.TestCase):
+    def test_old_image_cleanup_keeps_live_current_and_trusted_images(self):
+        def image(image_id, tags, managed=True):
+            value = Mock(id=image_id, tags=tags)
+            value.attrs = {"Config": {"Labels": {
+                "io.mdd-sim-gateway.managed": "true" if managed else "false"}}}
+            return value
+
+        current = image("current", ["mdd-sim-gateway/engine:latest",
+                                     "mdd-sim-gateway/engine:previous"])
+        base = image("base", ["mdd-sim-gateway/engine-base:trusted"])
+        live_old = image("live-old", ["mdd-sim-gateway/engine:emergency"])
+        rollback = image("rollback", ["mdd-sim-gateway/engine:previous",
+                                       "mdd-sim-gateway/engine:old-test"])
+        unrelated = image("other", ["other/app:latest"], managed=False)
+        client = Mock()
+        client.df.side_effect = [
+            {"ImageUsage": {"TotalSize": 10_000}},
+            {"ImageUsage": {"TotalSize": 6_000}},
+        ]
+        client.images.list.return_value = [current, base, live_old, rollback, unrelated]
+        client.containers.list.return_value = [Mock(image=live_old)]
+        with patch.object(operations.docker, "from_env", return_value=client):
+            result = operations.prune_old_mdd_images()
+
+        self.assertEqual(result, {"ok": True, "removed_images": 1,
+                                  "space_reclaimed_bytes": 4_000})
+        client.images.remove.assert_called_once_with(
+            "rollback", force=True, noprune=False)
+        client.containers.list.assert_called_once_with(all=True)
+        client.close.assert_called_once_with()
+
+    def test_build_cache_cleanup_uses_dangling_mode_without_all(self):
+        client = Mock()
+        client.api.prune_builds.return_value = {"SpaceReclaimed": 12345}
+        with patch.object(operations.docker, "from_env", return_value=client):
+            result = operations.prune_dangling_build_cache()
+        self.assertEqual(result, {"ok": True, "space_reclaimed_bytes": 12345})
+        client.api.prune_builds.assert_called_once_with(all=False)
+        client.close.assert_called_once_with()
+
     def test_engine_sources_do_not_log_authentication_secrets(self):
         root = Path(__file__).resolve().parents[1]
         sources = "\n".join(
@@ -59,12 +99,63 @@ class OperationsTests(unittest.TestCase):
         self.assertNotIn("001122", log)
         self.assertTrue(log.endswith("normal"))
 
+    def test_redaction_preserves_closed_identity_health_fields(self):
+        value = operations.redact({
+            "imei_valid": True, "iccid_valid": False, "imei_source_matches": True,
+            "imei": "123456789012345", "iccid": "8944000000000000000",
+            "nested": {"imei_valid": "not-a-boolean-secret"},
+        })
+        self.assertEqual(value["imei_valid"], True)
+        self.assertEqual(value["iccid_valid"], False)
+        self.assertEqual(value["imei_source_matches"], True)
+        self.assertEqual(value["imei"], "<redacted>")
+        self.assertEqual(value["iccid"], "<redacted>")
+        self.assertEqual(value["nested"]["imei_valid"], "<redacted>")
+
+    def test_redaction_preserves_registration_failure_evidence(self):
+        # The classified reg-failure verdict is digits and enum words only; losing it would
+        # re-open the #33 gap where a bundle could not say WHY registration was rejected.
+        value = operations.redact({
+            "registration_evidence": {"kind": "rejected", "sip_status": 403},
+            "sip_status": 403,
+        })
+        self.assertEqual(value["registration_evidence"],
+                         {"kind": "rejected", "sip_status": 403})
+        self.assertEqual(value["sip_status"], 403)
+
     def test_redaction_preserves_non_secret_eap_aka_diagnostics(self):
         diagnostic = (
             "IKE_AUTH rejected with AUTHENTICATION_FAILED before any EAP-AKA challenge "
             "(SIM not queried); the SIM may not be provisioned for VoWiFi"
         )
         self.assertEqual(operations.redact_log(diagnostic), diagnostic)
+
+    def test_redaction_removes_proxy_labels_nodes_and_host_addresses_by_path(self):
+        document = {
+            "proxy": {
+                "profiles": {"private-provider": {
+                    "name": "My private provider", "type": "node",
+                    "value": "vless://opaque-share-value",
+                }},
+                "exits": {"gb": {"profile_id": "private-provider",
+                                   "pinned_node": "Residential London"}},
+            },
+            "egress": {"node": "Residential London",
+                       "candidates": ["Residential London", "Backup London"],
+                       "ready": True},
+            "host": {"network": {"addresses": [
+                {"interface": "eth0", "family": "ipv4", "address": "192.0.2.44/24"}
+            ]}},
+        }
+
+        redacted = operations.redact(document)
+        encoded = json.dumps(redacted)
+
+        for private in ("private-provider", "My private provider", "opaque-share-value",
+                        "Residential London", "Backup London", "192.0.2.44"):
+            self.assertNotIn(private, encoded)
+        self.assertTrue(redacted["egress"]["ready"])
+        self.assertEqual(list(redacted["proxy"]["profiles"]), ["profile-1"])
 
     def test_apdu_trace_fallback_does_not_repeat_failed_unpack(self):
         source = (Path(__file__).resolve().parents[1] / "engine/swu_ike.py").read_text(
@@ -80,11 +171,37 @@ class OperationsTests(unittest.TestCase):
             self.assertNotIn("path", result)
             self.assertTrue(Path(temp, "backups", result["name"]).is_file())
 
+    def test_local_backup_can_be_deleted_by_its_listed_name(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            Path(temp, "config.yaml").write_text("settings: {}\ninstances: {}\n")
+            created = operations.create_local_backup("Test Gateway")
+            result = operations.delete_local_backup(created["name"])
+            self.assertTrue(result["ok"])
+            self.assertFalse(Path(temp, "backups", created["name"]).exists())
+
+    def test_local_backup_delete_rejects_paths_and_non_backups(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
+            outside = Path(temp, "keep.txt")
+            outside.write_text("keep")
+            for name in ("../keep.txt", "/tmp/keep.txt", "not-a-backup.txt"):
+                with self.assertRaises(ValueError):
+                    operations.delete_local_backup(name)
+            self.assertEqual(outside.read_text(), "keep")
+
     def test_support_bundle_contains_only_redacted_documents(self):
         settings_value = {
             "telegram": {"bot_token": "secret"},
             "proxy": {"subscription_url": "https://example.test/sub?token=url-secret"},
             "webhook": {"headers_json": '{"Authorization":"Bearer header-secret"}'},
+            "feishu": {
+                "url": "https://open.feishu.cn/open-apis/bot/v2/hook/private-token",
+                "secret": "feishu-signing-secret",
+                "channels": [{
+                    "id": "ops", "name": "Operations",
+                    "url": "https://open.feishu.cn/open-apis/bot/v2/hook/second-private-token",
+                    "secret": "second-feishu-secret", "instances": ["1"],
+                }],
+            },
         }
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), patch.object(
                 config, "get_settings", return_value=settings_value):
@@ -98,9 +215,123 @@ class OperationsTests(unittest.TestCase):
                 settings = archive.read("settings-redacted.yaml").decode()
                 status = json.loads(archive.read("status-redacted.json"))
                 log = archive.read("logs/sim1-charon.log").decode()
-            self.assertNotIn("secret", settings)
+            self.assertNotIn("feishu-signing-secret", settings)
+            self.assertNotIn("private-token", settings)
+            self.assertNotIn("second-private-token", settings)
+            self.assertNotIn("second-feishu-secret", settings)
+            self.assertNotIn("Operations", settings)
+            self.assertNotIn("header-secret", settings)
+            self.assertNotIn("url-secret", settings)
             self.assertNotIn("001122", log)
             self.assertEqual(status["imei"], "<redacted>")
+
+    def test_support_bundle_can_settle_a_service_code_verdict(self):
+        """A user reporting "the carrier does not support this code" must be checkable.
+
+        The verdict comes from the Q.850 cause on call_result, which lived only in
+        events.jsonl and was not collected at all — the bundle showed the conclusion and
+        never the evidence behind it.
+        """
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = archive.read("logs/sim1-call-events.jsonl").decode()
+
+        self.assertIn("*#21#", captured)     # which code was dialled
+        self.assertIn("79", captured)        # and what the carrier answered
+
+    def test_support_bundle_keeps_dialled_numbers_and_replies_out(self):
+        """The evidence must not smuggle in what redaction elsewhere is careful to remove.
+
+        A subscriber's number and a reply's text sit inside an `args` array, where the
+        key-name redaction rules never reach them.
+        """
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+8615001007220", "CANCEL", "127"]},
+            {"instance": "sim1", "event": "ussd", "args": ["#225#", "WW91ciBiYWxhbmNl"]},
+            {"instance": "sim1", "event": "sms_in", "args": ["6700", "cHJpdmF0ZQ=="]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = archive.read("logs/sim1-call-events.jsonl").decode()
+
+        self.assertNotIn("8615001007220", captured)   # a dialled number
+        self.assertNotIn("WW91ciBiYWxhbmNl", captured)  # the reply's own text
+        self.assertNotIn("cHJpdmF0ZQ==", captured)      # an SMS body
+        self.assertIn("<number>", captured)
+        self.assertIn("#225#", captured)              # the code itself still diagnosable
+        self.assertNotIn("sms_in", captured)          # message events are not call evidence
+
+    def test_support_bundle_keeps_the_hangup_side_but_nothing_else_in_its_slot(self):
+        events = "\n".join(json.dumps(r) for r in [
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+447700900123", "ANSWER", "16", "carrier"]},
+            {"instance": "sim1", "event": "call_result",
+             "args": ["out", "+447700900123", "ANSWER", "16", "+447700900999"]},
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(events + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                captured = [json.loads(l) for l in
+                            archive.read("logs/sim1-call-events.jsonl").decode().splitlines()]
+        self.assertEqual(captured[0]["args"], ["out", "<number>", "ANSWER", "16", "carrier"])
+        # The slot is a closed vocabulary; anything else is not let through as evidence.
+        self.assertEqual(captured[1]["args"][4], "<unknown>")
+
+    def test_support_bundle_carries_asterisk_problems_without_the_identity(self):
+        """An answered call that drops at once is explained only by Asterisk's own warnings.
+
+        `messages` also names the IMS public identity on every registration, so only the
+        WARNING/ERROR lines are taken, and every SIP/tel user part is removed from them.
+        """
+        messages = "\n".join([
+            "[Sep 21 22:05:00] NOTICE[100] res_pjsip_outbound_registration.c: Registered "
+            "'sip:234870000000001@ims.mnc087.mcc234.3gppnetwork.org'",
+            "[Sep 21 22:06:43] WARNING[2987][C-00000009] res_pjsip_sdp_rtp.c: No joint "
+            "capabilities for 'audio' from <sip:+447700900123@ims.example;user=phone>",
+            "[Sep 21 22:06:43] ERROR[2987][C-00000009] app_stack.c:390 return_exec: "
+            "Return without Gosub: stack is unallocated",
+            "[Sep 21 22:06:44] WARNING[2988] chan_pjsip.c: peer tel:+447700900456",
+        ])
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs", "asterisk")
+            logs.mkdir(parents=True)
+            logs.joinpath("messages").write_text(messages + "\n")
+            logs.joinpath("full").write_text("[Sep 21] WARNING[1] full-log-must-stay-out\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as archive:
+                names = archive.namelist()
+                captured = archive.read("logs/sim1-asterisk-problems.log").decode()
+                manifest = json.loads(archive.read("manifest.json"))
+
+        self.assertIn("No joint capabilities", captured)          # the evidence itself
+        self.assertIn("[C-00000009]", captured)                   # still tied to its call
+        self.assertIn("Return without Gosub", captured)
+        self.assertNotIn("Registered", captured)                  # NOTICE lines stay out
+        self.assertNotIn("234870000000001", captured)
+        self.assertNotIn("447700900123", captured)
+        self.assertNotIn("447700900456", captured)
+        self.assertIn("sip:<user>@ims.example", captured)
+        self.assertIn("tel:<number>", captured)
+        self.assertNotIn("full-log-must-stay-out", "".join(names) + captured)
+        self.assertEqual(manifest["files"]["logs/sim1-asterisk-problems.log"]
+                         ["filtered_lines"], 1)
 
     def test_support_bundle_carries_the_host_view_the_control_plane_cannot_observe(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
@@ -178,6 +409,127 @@ class OperationsTests(unittest.TestCase):
                     "logs/sim1-charon-20260807-110000.log").decode()
             self.assertIn("STATE 2", retained)
 
+    def test_support_bundle_indexes_coverage_and_keeps_ike_head_and_tail(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            archive_dir = logs / "ike"
+            archive_dir.mkdir(parents=True)
+            lifecycle = [
+                {"ts": 100 + i, "instance": "sim1", "event": "recovery_started"}
+                for i in range(3)]
+            logs.joinpath("lifecycle.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in lifecycle) + "\n")
+            ike = archive_dir / "charon-20260830-100000.log"
+            ike.write_text("\n".join(f"line-{i:02d}" for i in range(60)) + "\n")
+
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}, log_lines=50))) as bundle:
+                retained = bundle.read("logs/sim1-charon-20260830-100000.log").decode()
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        self.assertIn("line-00", retained)
+        self.assertIn("line-59", retained)
+        self.assertNotIn("line-15", retained)
+        ike_meta = manifest["files"]["logs/sim1-charon-20260830-100000.log"]
+        self.assertEqual(ike_meta["raw_lines"], 60)
+        self.assertEqual(ike_meta["included_lines"], 50)
+        self.assertTrue(ike_meta["truncated"])
+        life_meta = manifest["files"]["logs/sim1-lifecycle.jsonl"]
+        self.assertEqual((life_meta["first_ts"], life_meta["last_ts"]), (100, 102))
+
+    def test_lifecycle_file_is_redacted_even_if_a_bad_record_reaches_disk(self):
+        record = {
+            "ts": 100, "instance": "sim1", "event": "recovery_failed",
+            "reason_code": "engine_start_failed", "imei": "123456789012345",
+            "iccid": "8944000000000000000", "error": "https://secret.example/token",
+        }
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("lifecycle.jsonl").write_text(json.dumps(record) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                captured = bundle.read("logs/sim1-lifecycle.jsonl").decode()
+
+        for secret in ("123456789012345", "8944000000000000000", "secret.example"):
+            self.assertNotIn(secret, captured)
+        parsed = json.loads(captured)
+        self.assertEqual(parsed["reason_code"], "engine_start_failed")
+
+    def test_support_bundle_enforces_its_archive_budget_and_reports_omissions(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}), \
+                patch.object(operations, "SUPPORT_BUNDLE_CONTENT_BYTES", 900), \
+                patch.object(operations, "SUPPORT_BUNDLE_MAX_BYTES", 4096):
+            run = Path(temp, "instances", "sim1", "run")
+            run.mkdir(parents=True)
+            run.joinpath("charon.log").write_text(
+                "\n".join(f"ordinary-line-{i}-" + "x" * 80 for i in range(100)))
+            content = operations.support_bundle({})
+            with zipfile.ZipFile(BytesIO(content)) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        self.assertLessEqual(len(content), 4096)
+        omitted = manifest["files"]["logs/sim1-charon.log"]
+        self.assertTrue(omitted["omitted"])
+        self.assertFalse(omitted["truncated"])
+        self.assertEqual(omitted["included_lines"], 0)
+
+    def test_call_event_coverage_uses_the_filtered_archived_records(self):
+        records = [
+            {"ts": index, "instance": "sim1", "event": "sms_in", "args": ["1", "secret"]}
+            for index in range(1, 9)
+        ] + [
+            {"ts": 9, "instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"ts": 10, "instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        coverage = manifest["files"]["logs/sim1-call-events.jsonl"]
+        self.assertEqual(coverage["raw_lines"], 10)
+        self.assertEqual(coverage["scanned_lines"], 10)
+        self.assertEqual(coverage["unscanned_lines"], 0)
+        self.assertEqual(coverage["eligible_lines"], 2)
+        self.assertEqual(coverage["filtered_lines"], 8)
+        self.assertEqual(coverage["included_lines"], 2)
+        self.assertEqual((coverage["first_ts"], coverage["last_ts"]), (9, 10))
+        self.assertFalse(coverage["truncated"])
+
+    def test_call_event_scan_is_bounded_and_reports_the_unscanned_prefix(self):
+        records = [
+            {"ts": index, "instance": "sim1", "event": "sms_in", "args": ["1", "secret"]}
+            for index in range(1, 6)
+        ] + [
+            {"ts": 6, "instance": "sim1", "event": "call_out", "args": ["*#21#"]},
+            {"ts": 7, "instance": "sim1", "event": "call_result",
+             "args": ["out", "*#21#", "CHANUNAVAIL", "79"]},
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp), \
+                patch.object(config, "get_settings", return_value={}), \
+                patch.object(operations, "CALL_EVENT_SCAN_LINES", 3):
+            logs = Path(temp, "instances", "sim1", "logs")
+            logs.mkdir(parents=True)
+            logs.joinpath("events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n")
+            with zipfile.ZipFile(BytesIO(operations.support_bundle({}))) as bundle:
+                manifest = json.loads(bundle.read("manifest.json"))
+
+        coverage = manifest["files"]["logs/sim1-call-events.jsonl"]
+        self.assertEqual(coverage["raw_lines"], 7)
+        self.assertEqual(coverage["scanned_lines"], 3)
+        self.assertEqual(coverage["unscanned_lines"], 4)
+        self.assertEqual(coverage["eligible_lines"], 2)
+        self.assertEqual(coverage["filtered_lines"], 1)
+        self.assertTrue(coverage["truncated"])
+
     def test_diagnostic_records_survive_redaction_instead_of_being_blanked(self):
         # engine.capture_diagnostics embeds the tunnel log tail in each record, and swu_ike
         # prints "received decoded message" on every fragmented exchange. Under the line
@@ -241,6 +593,22 @@ class OperationsTests(unittest.TestCase):
         # A line that will not parse must not become a hole in the redaction.
         self.assertNotIn("00112233445566778899", text)
         self.assertIn("<redacted cryptographic material>", text.splitlines()[-1])
+
+    def test_diagnostic_redaction_removes_issue_21_support_bundle_leaks(self):
+        record = {
+            "reason": "health-freeze:reg_rejected",
+            "egress": {"node": "Private exit name", "selection": "auto", "ready": True},
+            "host": {"alerts": [], "network": {"addresses": [
+                {"interface": "eth0", "family": "ipv4", "address": "198.51.100.8/24"}
+            ]}},
+        }
+
+        parsed = json.loads(operations.redact_jsonl(json.dumps(record)))
+
+        self.assertEqual(parsed["egress"]["node"], "<redacted>")
+        self.assertEqual(parsed["host"]["network"]["addresses"][0]["address"], "<redacted>")
+        self.assertEqual(parsed["reason"], "health-freeze:reg_rejected")
+        self.assertTrue(parsed["egress"]["ready"])
 
     def test_plain_logs_keep_the_strict_whole_line_rules(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(config, "DATA_DIR", temp):
@@ -373,6 +741,87 @@ class ServiceRestartTests(unittest.TestCase):
 
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
+
+    def test_a_container_restart_that_never_completes_is_reported_failed(self):
+        self.root.mkdir(parents=True)
+        (self.root / "service-restart-status.json").write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container",
+            "updated_at": int(time.time()) - 300}))
+        status = operations.service_restart_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_code"], "restart.error.failed")
+
+    def test_container_mode_rejects_host_reboot_without_publishing_a_request(self):
+        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
+            result = operations.request_service_restart("host")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "restart.error.host_unavailable")
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_container_service_restart_checks_ownership_and_orders_base_services_first(self):
+        restarted = []
+
+        class Container:
+            def __init__(self, component):
+                self.attrs = {"Config": {"Labels": {
+                    "io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": component}}}
+                self.component = component
+                self.image = Mock(id=f"sha256:{component}")
+            def restart(self, timeout):
+                self.assert_timeout = timeout
+                restarted.append(self.component)
+
+        containers = {name: Container(component) for component, name in {
+            "control": "mdd-sim-gateway-control",
+            "hardware": "mdd-sim-gateway-hardware",
+            "egress": "mdd-sim-gateway-egress"}.items()}
+        client = Mock()
+        client.containers.get.side_effect = containers.__getitem__
+        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
+            operations.request_service_restart("services")
+            result = operations.perform_container_service_restart("services", client)
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(restarted, ["egress", "hardware"])
+        client.containers.run.assert_called_once()
+        helper = client.containers.run.call_args
+        self.assertEqual(helper.args[0], "sha256:control")
+        self.assertEqual(helper.kwargs["network_mode"], "none")
+        self.assertEqual(helper.kwargs["healthcheck"], {"test": ["NONE"]})
+        self.assertEqual(len(helper.kwargs["command"]), 1)
+        self.assertIn("mdd-sim-gateway-control", helper.kwargs["command"][0])
+        self.assertIn("target.restart(timeout=30)", helper.kwargs["command"][0])
+        self.assertTrue((self.root / "pcsc-maintenance").is_file())
+        self.assertFalse((self.root / "service-restart-request.json").exists())
+
+    def test_container_restart_refuses_a_foreign_named_container(self):
+        foreign = Mock()
+        foreign.attrs = {"Config": {"Labels": {}}}
+        client = Mock()
+        client.containers.get.return_value = foreign
+        operations.request_service_restart("control")
+        result = operations.perform_container_service_restart("control", client)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("unowned", result["error"])
+        foreign.restart.assert_not_called()
+
+    def test_container_restart_reports_an_unavailable_docker_daemon(self):
+        operations.request_service_restart("control")
+        with patch.object(operations.docker, "from_env",
+                          side_effect=RuntimeError("daemon unavailable")):
+            result = operations.perform_container_service_restart("control")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_code"], "restart.error.failed")
+        self.assertIn("daemon unavailable", result["error"])
+
+    def test_returning_control_process_settles_container_restart(self):
+        status_path = self.root / "service-restart-status.json"
+        self.root.mkdir(parents=True)
+        status_path.write_text(json.dumps({
+            "state": "running", "scope": "control", "executor": "container"}))
+        status = operations.settle_container_service_restart()
+        self.assertEqual(status["state"], "success")
 
 
 if __name__ == "__main__":

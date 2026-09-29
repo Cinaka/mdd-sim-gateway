@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 from control.app import failover, main
 
 
-OURS = "8901260444723809824"
-THEIRS = "8944303773524072104"
+OURS = "8900000000000000022"
+THEIRS = "8900000000000000031"
 BOUND = "VoWiFi Modem 2c7c-0125-4-1 00 00"
 OTHER = "VoWiFi Modem 2c7c-0125-1-1 00 00"
 
@@ -146,10 +146,12 @@ class ExitAttributionTests(unittest.TestCase):
                 patch.object(main, "engine", MagicMock()), \
                 patch.object(main, "_peer_line_registered", return_value=False), \
                 patch.object(main, "_save_exit_ledgers"), \
+                patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": True}}), \
                 patch.object(main, "failover", MagicMock(
                     HOLD=failover.HOLD, SWITCH=failover.SWITCH, GIVE_UP=failover.GIVE_UP,
                     REPORT=failover.REPORT, BACK_OFF=failover.BACK_OFF)) as policy:
-            egress.status.return_value = {"exits": {}}
+            egress.line_country.return_value = "us"
+            egress.status.return_value = {"exits": {"us": {"mode": "subscription", "node": "a"}}}
             policy.record.return_value = (failover.HOLD, {})
             main._judge_exit_failure("1", {}, {"reason_code": "reg_rejected"}, 0.0)
         policy.classify.assert_called_once()

@@ -16,7 +16,8 @@
 #   - pcsc-lite is version-LOCKED (PCSC_VERSION) across the host + every container image so the
 #     PC/SC client/server protocol always matches (distro defaults differ -> "Failed to
 #     establish context")
-#   - the engine image is built from source with all bug-fix patches baked in (engine/patches/*)
+#   - official releases import the verified native Engine image; development checkouts build it
+#     from source with all bug-fix patches baked in (engine/patches/*)
 #
 # Usage:
 #   sudo ./install.sh install [--mode local|docker]   # full install (default mode: local)
@@ -36,8 +37,12 @@
 #   MDD_ADVERTISE_ADDR  host LAN IP for SIP/WebRTC media           (default: auto-detect)
 #   MDD_BIND            control bind addr                          (default 0.0.0.0)
 #   MDD_ENGINE_BASE_IMAGE optional trusted local engine image for an offline overlay migration
+#   MDD_ENGINE_DISTRIBUTION_IMAGE optional already-pulled, release-matched Engine image
+#   PJPROJECT_REPOSITORY optional reviewed pjproject Git repository override for a full build
+#   ASTERISK_REPOSITORY optional reviewed Asterisk Git repository override for a full build
 #   MDD_REUSE_WEBUI     set to 1 to reuse a prebuilt, reviewed webui/dist in an offline install
 #   MDD_REUSE_CONTROL_IMAGE set to 1 to reuse a checksummed Release control image (docker mode)
+#   MDD_BUILD_IMAGES    set to 1 to build images from source instead of using Release assets
 #   PCSC_VERSION           pinned pcsc-lite version                   (default 2.3.3)
 #   LPAC_SRC               optional path to lpac source (for build-lpac)
 #   CMAKE_FETCH_VER        Kitware cmake version if system is too old (default 3.31.12)
@@ -63,8 +68,11 @@ MDD_ADVERTISE_ADDR="${MDD_ADVERTISE_ADDR:-}"
 
 CONTROL_IMAGE="mdd-sim-gateway/control"
 ENGINE_IMAGE="mdd-sim-gateway/engine"
+ENGINE_HANDOFF_MANIFEST="$REPO_DIR/engine/release-image.SHA256SUMS"
 CONTROL_NAME="mdd-sim-gateway-control"
 ENGINE_PREFIX="mdd-sim-gateway-engine-"
+RELAY_NAME="mdd-sim-gateway-relay"
+MEDIA_NETWORK="mdd-sim-gateway-media"
 MDD_DOCKER_LABEL="io.mdd-sim-gateway.managed"
 WEBUI_BUILD_IMAGE="node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
 
@@ -111,9 +119,13 @@ VPCD_SLOTS="${VPCD_SLOTS:-4}"
 SINGBOX_VERSION="${MDD_SINGBOX_VERSION:-1.13.15}"
 SINGBOX_SHA256_AMD64="a3a3ff223b23c3f4731d0a17cb0ef94c97ce257c70721a5b07dc7ca079203c9f"
 SINGBOX_SHA256_ARM64="f0810bbb5722ae36635687c421019defcc8b328d31a0b3c287901f331747ca93"
+# 26.3.27 is the newest release Xray marks stable; everything after it is a prerelease.
+# REALITY moves with Xray, so an operator whose server runs a prerelease may need to match
+# it here. Overriding the version alone would only fail the checksum of the pinned one, so
+# the digests are overridable together with it — a reviewed override, never a silent one.
 XRAY_VERSION="${MDD_XRAY_VERSION:-26.3.27}"
-XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
+XRAY_SHA256_AMD64="${MDD_XRAY_SHA256_AMD64:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}"
+XRAY_SHA256_ARM64="${MDD_XRAY_SHA256_ARM64:-4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c}"
 LPAC_VERSION="${MDD_LPAC_VERSION:-2.3.0}"
 LPAC_COMMIT="c2fcf5e4b21c712d54e35a11da2ad9ad134fb821"
 CMAKE_SHA256_AMD64="0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c"
@@ -203,13 +215,62 @@ ensure_xray() {
 }
 
 ensure_cellular_tools() {
-  if have apt-get; then pkg_install modemmanager network-manager dbus
-  elif have dnf || have yum; then pkg_install ModemManager NetworkManager dbus
-  elif have pacman; then pkg_install modemmanager networkmanager dbus
+  if have apt-get; then pkg_install modemmanager network-manager mobile-broadband-provider-info dbus
+  elif have dnf || have yum; then pkg_install ModemManager NetworkManager mobile-broadband-provider-info dbus
+  elif have pacman; then pkg_install modemmanager networkmanager mobile-broadband-provider-info dbus
   fi
   have mmcli || die "ModemManager command mmcli is unavailable"
   have nmcli || die "NetworkManager command nmcli is unavailable"
   ensure_modemmanager_command_interface
+  ensure_mms_at_port_rule
+}
+
+# Sending MMS through a modem's embedded TCP/IP stack needs an AT port the gateway owns:
+# through ModemManager's command channel the module's upload command never completes, so each
+# chunk waits out a timeout, and a run of them makes ModemManager drop the modem. This rule
+# releases only a port ModemManager itself classifies as a Quectel module's *secondary* AT
+# port; the primary AT port and QMI/MBIM stay with ModemManager, and a module with a single
+# AT port has no secondary one to match.
+MMS_AT_PORT_RULE="${MDD_UDEV_RULES_DIR:-/etc/udev/rules.d}/78-mdd-mms-at-port.rules"
+
+# Re-evaluate tty udev properties and let ModemManager re-probe with them. Both are needed: a
+# changed rules file only reaches the udev database on the next event for the device, and
+# ModemManager reads ID_MM_PORT_IGNORE when it probes a port.
+reapply_modem_port_rules() {
+  if have udevadm; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --action=change --subsystem-match=tty 2>/dev/null || true
+    udevadm settle --timeout=10 2>/dev/null || true
+  fi
+  if have systemctl && systemctl is-active ModemManager.service >/dev/null 2>&1; then
+    systemctl restart ModemManager.service
+  fi
+}
+
+ensure_mms_at_port_rule() {
+  [ -d "$(dirname "$MMS_AT_PORT_RULE")" ] || return 0
+  rule_file=$MMS_AT_PORT_RULE
+  temporary=$(mktemp /tmp/mdd-udev.XXXXXX)
+  cat >"$temporary" <<'RULE'
+# MDD Sim Gateway: let the gateway own a Quectel module's secondary AT port for MMS uploads.
+# ModemManager keeps the primary AT port and QMI; a module with a single AT port is unaffected.
+ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="2c7c", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}=="1", ENV{ID_MM_PORT_IGNORE}="1"
+RULE
+  if [ ! -f "$rule_file" ] || ! cmp -s "$temporary" "$rule_file"; then
+    install -m 0644 "$temporary" "$rule_file"
+    info "releasing the modem's secondary AT port for MMS (ModemManager restarts)…"
+    reapply_modem_port_rules
+  fi
+  rm -f "$temporary"
+}
+
+# Uninstall: give the port back. Removing the file alone would leave ID_MM_PORT_IGNORE in the
+# udev database, and the port ignored, until the next reboot.
+remove_mms_at_port_rule() {
+  [ -f "$MMS_AT_PORT_RULE" ] || return 0
+  rm -f "$MMS_AT_PORT_RULE"
+  info "returning the modem's secondary AT port to ModemManager (ModemManager restarts)…"
+  reapply_modem_port_rules
 }
 
 # The module SIM bridge sends APDUs through ModemManager's guarded AT command API.  Upstream
@@ -555,23 +616,10 @@ _build_pcsclite_host() {
 # Dockerfile — so an unforced reinstall reuses the existing patched image instead of rebuilding it.
 # Files the overlay can refresh on its own, versus the ones that decide what the base contains.
 # Splitting them is what lets an update ship an engine fix without a 15-minute Asterisk rebuild.
-ENGINE_RUNTIME_FILES="pin_keeper.py ami_usim.py swu_ike.py log_capture.py render.py notify.py entrypoint.sh"
 ENGINE_BASE_TAG="mdd-sim-gateway/engine-base:trusted"
 
 engine_fingerprint() {
-  # $1: runtime|base. Hash of the inputs that class owns; order is fixed so it is reproducible.
-  eng="$REPO_DIR/engine"
-  if [ "$1" = runtime ]; then
-    # shellcheck disable=SC2086
-    { for f in $ENGINE_RUNTIME_FILES; do [ -f "$eng/$f" ] && cat "$eng/$f"; done
-      find "$eng/templates" -type f 2>/dev/null | LC_ALL=C sort | while read -r t; do cat "$t"; done
-    } | sha256sum | cut -d' ' -f1
-  else
-    { cat "$eng/Dockerfile" 2>/dev/null
-      echo "pcsc=$PCSC_VERSION"
-      find "$eng/patches" -type f 2>/dev/null | LC_ALL=C sort | while read -r p; do cat "$p"; done
-    } | sha256sum | cut -d' ' -f1
-  fi
+  PCSC_VERSION="$PCSC_VERSION" sh "$REPO_DIR/tools/engine-fingerprint.sh" "$1"
 }
 
 engine_image_label() {
@@ -586,10 +634,39 @@ engine_image_label() {
 # registry at all. Forcing still overrides everything.
 ensure_engine_image() {
   force="${1:-}"
+  # Whether this call replaced the image. A running container keeps the image it started
+  # from, so an upgrade that rebuilds the image but leaves the containers alone silently
+  # ships nothing: the lines go on serving the old dialplan. The caller uses this to decide
+  # whether the containers have to be re-created, instead of asking the operator to know.
+  ENGINE_IMAGE_CHANGED=0
   runtime_fp=$(engine_fingerprint runtime)
   base_fp=$(engine_fingerprint base)
   have_image=0
   docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 && have_image=1
+
+  if [ -n "${MDD_ENGINE_DISTRIBUTION_IMAGE:-}" ]; then
+    distributed="$MDD_ENGINE_DISTRIBUTION_IMAGE"
+    docker image inspect "$distributed" >/dev/null 2>&1 || \
+      die "distributed engine image not found: $distributed"
+    expected_version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+    expected_arch=$(uname -m)
+    [ "$expected_arch" = aarch64 ] && expected_arch=arm64
+    [ "$expected_arch" = x86_64 ] && expected_arch=amd64
+    identity=$(docker image inspect "$distributed" --format \
+      '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.mdd-sim-gateway.runtime-fp"}}|{{index .Config.Labels "io.mdd-sim-gateway.base-fp"}}' 2>/dev/null || true)
+    expected="$expected_arch|$expected_version|$runtime_fp|$base_fp"
+    [ "$identity" = "$expected" ] || \
+      die "distributed engine image identity mismatch: ${identity:-unreadable}"
+    if [ "$have_image" = 1 ]; then
+      docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" || \
+        die "could not preserve the current engine image"
+    fi
+    docker tag "$distributed" "$ENGINE_IMAGE" || die "could not activate distributed engine image"
+    docker tag "$distributed" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
+    ENGINE_IMAGE_CHANGED=1
+    info "using verified distributed engine image $distributed"
+    return
+  fi
 
   if [ "$have_image" = 1 ] && [ -z "$force" ] && [ -z "$NOCACHE_FLAG" ]; then
     image_runtime=$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)
@@ -601,13 +678,17 @@ ensure_engine_image() {
     if [ -n "$image_base" ] && [ "$image_base" = "$base_fp" ]; then
       # Only runtime-owned files moved: refresh them onto the image already installed.
       info "engine scripts changed — refreshing them onto the existing image (no rebuild)"
-      engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp" && return
+      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
+        ENGINE_IMAGE_CHANGED=1; return
+      fi
       warn "overlay refresh failed; falling back to a full engine rebuild"
     elif [ -z "$image_base" ]; then
       # Built before fingerprints existed: adopt it as the base and stamp it, rather than
       # forcing every existing install through a rebuild it may not be able to complete.
       info "engine image predates fingerprinting — refreshing scripts onto it and stamping it"
-      engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp" && return
+      if engine_overlay_build "$ENGINE_IMAGE" "$runtime_fp" "$base_fp"; then
+        ENGINE_IMAGE_CHANGED=1; return
+      fi
       warn "overlay refresh failed; falling back to a full engine rebuild"
     else
       info "engine base inputs changed (Dockerfile/patches/pcsc) — full rebuild required"
@@ -620,17 +701,130 @@ ensure_engine_image() {
     info "building offline engine overlay from trusted local image $MDD_ENGINE_BASE_IMAGE"
     engine_overlay_build "$MDD_ENGINE_BASE_IMAGE" "$runtime_fp" "$base_fp" || \
       die "offline engine overlay build failed"
+    ENGINE_IMAGE_CHANGED=1
   else
     info "building engine image ($ENGINE_IMAGE) from source — long; compiles Asterisk+pcsc-lite+Python SWu tunnel deps and bakes engine/patches/*…"
-    # shellcheck disable=SC2086
-    docker build $NOCACHE_FLAG --build-arg "PCSC_VERSION=$PCSC_VERSION" \
+    # The reviewed GitHub mirrors remain the Dockerfile defaults. Some installation networks can
+    # reach the reviewed upstream sysmocom repositories but not GitHub, so preserve an explicit
+    # override instead of trapping a forced full build behind one hard-coded route. Build the
+    # argument vector incrementally so repository URLs remain one quoted argument.
+    set -- docker build
+    [ -n "$NOCACHE_FLAG" ] && set -- "$@" "$NOCACHE_FLAG"
+    set -- "$@" --build-arg "PCSC_VERSION=$PCSC_VERSION" \
       --build-arg "RUNTIME_FP=$runtime_fp" --build-arg "BASE_FP=$base_fp" \
-      -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
+      --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")"
+    [ -n "${PJPROJECT_REPOSITORY:-}" ] && \
+      set -- "$@" --build-arg "PJPROJECT_REPOSITORY=$PJPROJECT_REPOSITORY"
+    [ -n "${ASTERISK_REPOSITORY:-}" ] && \
+      set -- "$@" --build-arg "ASTERISK_REPOSITORY=$ASTERISK_REPOSITORY"
+    "$@" -t "$ENGINE_IMAGE" "$REPO_DIR/engine"
     # Keep the full build as the base every future overlay starts from, so repeated updates
     # stack one layer on a known-good image instead of a layer per update.
     docker tag "$ENGINE_IMAGE" "$ENGINE_BASE_TAG" >/dev/null 2>&1 || true
+    ENGINE_IMAGE_CHANGED=1
   fi
   info "engine image built"
+}
+
+# v1.4.1's updater deliberately invokes the newly applied installer with --no-engines because
+# distributed Engine images did not exist yet. A release-only checksum manifest lets the new
+# installer recognise that one transition, reuse the old updater's still-live route list, and
+# import the matching Release asset instead of silently leaving the old Engine behind.
+engine_matches_checkout() {
+  docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || return 1
+  runtime_fp=$(engine_fingerprint runtime)
+  base_fp=$(engine_fingerprint base)
+  [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.runtime-fp)" = "$runtime_fp" ] && \
+    [ "$(engine_image_label "$ENGINE_IMAGE" io.mdd-sim-gateway.base-fp)" = "$base_fp" ]
+}
+
+control_image_matches_checkout() {
+  docker image inspect "$CONTROL_IMAGE" >/dev/null 2>&1 || return 1
+  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+  identity=$(docker image inspect "$CONTROL_IMAGE" --format \
+    '{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}' \
+    2>/dev/null || true)
+  [ "$identity" = "$(host_arch)|$version" ]
+}
+
+handoff_release_images() {
+  have python3 || die "python3 is required to import the Release image assets"
+  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+  repository=${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}
+  network_file="$MDD_DATA_DIR/update/network.json"
+  if [ -f "$network_file" ]; then
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --network-config "$network_file" \
+      --install-images --install-mode "$MODE") || \
+      die "could not import the Release image assets"
+  else
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --install-images --install-mode "$MODE") || \
+      die "could not import the Release image assets"
+  fi
+  [ -n "$distributed" ] || die "Release image handoff returned no Engine image"
+  MDD_ENGINE_DISTRIBUTION_IMAGE=$distributed
+  MDD_PRUNE_BUILD_CACHE=1
+  export MDD_ENGINE_DISTRIBUTION_IMAGE MDD_PRUNE_BUILD_CACHE
+  if [ "$MODE" = docker ]; then
+    MDD_REUSE_CONTROL_IMAGE=1
+    export MDD_REUSE_CONTROL_IMAGE
+  fi
+  info "old updater handed off to verified $(host_arch) Release images"
+}
+
+# An official source archive contains a CI-generated image checksum manifest. A development
+# checkout does not, so it keeps the normal source-build behavior. This makes fresh installs use
+# the same architecture-checked Release assets as one-click updates without trusting a floating
+# registry tag or silently falling back to a lengthy build after a verification failure.
+prepare_release_images() {
+  [ "${MDD_BUILD_IMAGES:-0}" != 1 ] || {
+    info "building images from source (MDD_BUILD_IMAGES=1)"
+    return 0
+  }
+  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return 0
+  have python3 || die "python3 is required to import Release image assets"
+  MDD_REUSE_WEBUI=1
+  MDD_PRUNE_BUILD_CACHE=1
+  export MDD_REUSE_WEBUI MDD_PRUNE_BUILD_CACHE
+  if engine_matches_checkout; then
+    if [ "$MODE" = local ]; then
+      info "installed Engine already matches the official release — reusing images"
+      return 0
+    fi
+    if control_image_matches_checkout; then
+      MDD_REUSE_CONTROL_IMAGE=1
+      export MDD_REUSE_CONTROL_IMAGE
+      info "installed Engine and Control already match the official release — reusing images"
+      return 0
+    fi
+  fi
+  version=$(tr -d '\n' < "$REPO_DIR/VERSION")
+  repository=${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}
+  network_file="$MDD_DATA_DIR/update/network.json"
+  info "downloading verified $(host_arch) Release images for a fresh install…"
+  if [ -f "$network_file" ]; then
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --network-config "$network_file" \
+      --install-images --install-mode "$MODE") || \
+      die "could not import Release images; set MDD_BUILD_IMAGES=1 to build from source"
+  else
+    distributed=$(python3 "$REPO_DIR/host/mdd_update.py" \
+      --repo "$REPO_DIR" --data "$MDD_DATA_DIR" --version "$version" \
+      --repository "$repository" --install-images --install-mode "$MODE") || \
+      die "could not import Release images; set MDD_BUILD_IMAGES=1 to build from source"
+  fi
+  [ -n "$distributed" ] || die "Release image importer returned no Engine image"
+  MDD_ENGINE_DISTRIBUTION_IMAGE=$distributed
+  export MDD_ENGINE_DISTRIBUTION_IMAGE MDD_REUSE_WEBUI MDD_PRUNE_BUILD_CACHE
+  if [ "$MODE" = docker ]; then
+    MDD_REUSE_CONTROL_IMAGE=1
+    export MDD_REUSE_CONTROL_IMAGE
+  fi
+  info "using verified Release images for $(host_arch)"
 }
 
 # Overlay the runtime-owned files onto $1 and retag the result as the engine image. Needs no
@@ -648,6 +842,7 @@ engine_overlay_build() {
     docker tag "$ENGINE_IMAGE" "$ENGINE_IMAGE:previous" >/dev/null 2>&1
   docker build --build-arg "BASE_IMAGE=$overlay_base" \
     --build-arg "RUNTIME_FP=$overlay_runtime_fp" --build-arg "BASE_FP=$overlay_base_fp" \
+    --build-arg "MDD_VERSION=$(tr -d '\n' < "$REPO_DIR/VERSION")" \
     -t "$ENGINE_IMAGE" -f "$REPO_DIR/engine/Dockerfile.overlay" "$REPO_DIR/engine"
 }
 
@@ -740,12 +935,21 @@ setup_venv() {
   # vendored networking stack and lets a fully provisioned host reload offline. Only a genuinely
   # missing or changed dependency needs the package index. Do not upgrade pip on every reload;
   # replacing the installer itself creates needless network and compatibility risk.
-  if "$VENV_DIR/bin/pip" install --quiet --no-index \
+  if "$VENV_DIR/bin/python" -m pip install --quiet --no-index \
       -r "$REPO_DIR/control/requirements.txt" >/dev/null 2>&1; then
     info "control requirements already satisfied — reusing the installed packages"
   else
-    "$VENV_DIR/bin/pip" install --quiet wheel -r "$REPO_DIR/control/requirements.txt"
+    "$VENV_DIR/bin/python" -m pip install --quiet wheel \
+      -r "$REPO_DIR/control/requirements.txt" \
+      || die "installing the control requirements failed; nothing has been restarted. An offline host needs the wheels available first."
   fi
+  # Installed is not the same as usable: Pillow and pi-heif carry native libraries, and
+  # the control plane deliberately starts without them -- MMS picture conversion then simply
+  # stops, which nobody notices until a photo is sent. A reload must not leave the gateway in
+  # that state, so prove the venv imports what the control plane needs before it is restarted.
+  # Add to this list when a dependency brings native code of its own.
+  "$VENV_DIR/bin/python" -c "import PIL.Image, pi_heif" >/dev/null 2>&1 \
+    || die "the control requirements install but do not import (Pillow/pi-heif); nothing has been restarted."
   info "venv ready"
 }
 
@@ -774,6 +978,8 @@ Type=simple
 WorkingDirectory=$REPO_DIR/control
 Environment=MDD_DATA=$DATA_ABS
 Environment=MDD_HOST_DATA=$DATA_ABS
+Environment=MDD_REPO_DIR=$REPO_DIR
+Environment=MDD_VENV_DIR=$VENV_DIR
 Environment=MDD_WEBUI=$WEBUI_DIST
 Environment=MDD_HTTP_PORT=$MDD_PORT
 Environment=MDD_BIND=$MDD_BIND
@@ -962,6 +1168,29 @@ remove_orchestrator() {
 }
 
 # ------------------------------------------------------------------ containerized control plane
+# SWU_TUN_MTU fixes the engines' ipsec0 MTU for a carrier that drops fragments; the control plane
+# hands it to every engine it starts. A native install keeps it in a systemd drop-in, which a
+# reload leaves alone. The docker-mode control container is recreated on every reload, so take
+# the value from the installer's environment, else from the container being replaced: an update
+# must not silently put the engines back on the default. SWU_TUN_MTU=default drops a carried-over
+# value. Anything outside 1280-1500 is ignored: below 1280 the kernel takes IPv6 off ipsec0,
+# which an IPv6 PDN needs, and above 1500 the ESP packets cannot fit a normal uplink.
+control_tun_mtu() {
+  value="${SWU_TUN_MTU:-}"
+  [ "$value" = default ] && return 0
+  [ -n "$value" ] || value=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$CONTROL_NAME" 2>/dev/null | sed -n 's/^SWU_TUN_MTU=//p' | head -n 1)
+  case "$value" in
+    '') ;;
+    *[!0-9]*) warn "ignoring SWU_TUN_MTU=$value (not a number)" >&2 ;;
+    *) if [ "${#value}" -le 4 ] && [ "$value" -ge 1280 ] && [ "$value" -le 1500 ]; then
+         printf '%s' "$value"
+       else
+         warn "ignoring SWU_TUN_MTU=$value (outside 1280-1500)" >&2
+       fi ;;
+  esac
+}
+
 run_control() {
   install -d -m 0700 "$MDD_DATA_DIR"
   DATA_ABS=$(data_dir_abs)
@@ -969,6 +1198,7 @@ run_control() {
   [ -z "$LAN_IP" ] && LAN_IP=$(detect_lan_ip)
   [ -z "$LAN_IP" ] && warn "could not auto-detect a LAN IP; set MDD_ADVERTISE_ADDR — SIP/WebRTC audio needs a routable host address"
 
+  TUN_MTU=$(control_tun_mtu)
   if docker inspect "$CONTROL_NAME" >/dev/null 2>&1; then
     docker_container_owned "$CONTROL_NAME" || die "refusing to replace foreign container '$CONTROL_NAME'"
     docker rm -f "$CONTROL_NAME" >/dev/null
@@ -983,6 +1213,9 @@ run_control() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /run/pcscd:/run/pcscd \
     -v /run/dbus:/run/dbus:ro \
+    -v /usr/local/bin/sing-box:/usr/local/bin/sing-box:ro \
+    -v /usr/local/bin/xray:/usr/local/bin/xray:ro \
+    -v "${REPO_DIR}/host:/app/host:ro" \
     -v "${DATA_ABS}:/data" \
     -e MDD_DATA=/data \
     -e MDD_HOST_DATA="${DATA_ABS}" \
@@ -992,24 +1225,51 @@ run_control() {
     -e MDD_MANAGER_URL="https://host.docker.internal:${MDD_PORT}" \
     -e MDD_ENGINE_IMAGE="${ENGINE_IMAGE}" \
     -e MDD_PCSCD_DIR=/run/pcscd \
+    ${TUN_MTU:+-e SWU_TUN_MTU=$TUN_MTU} \
+    -e MDD_SINGBOX_BIN=/usr/local/bin/sing-box \
+    -e MDD_XRAY_BIN=/usr/local/bin/xray \
     "$CONTROL_IMAGE"
+}
+
+# Re-scan present cards after old engine containers have been removed. Restart only the control
+# plane: restarting the orchestrator here would also rebuild pcscd while new engines start.
+restart_control_plane() {
+  if [ "$MODE" = local ]; then
+    have systemctl || return 1
+    systemctl restart mdd-sim-gateway-control || return 1
+  else
+    managed_control_exists || return 1
+    docker restart "$CONTROL_NAME" >/dev/null || return 1
+  fi
+}
+
+cleanup_release_artifacts() {
+  set -- python3 "$REPO_DIR/host/mdd_image_cleanup.py" \
+    --version "$(tr -d '\n' < "$REPO_DIR/VERSION")"
+  [ "${MDD_PRUNE_BUILD_CACHE:-0}" != 1 ] || set -- "$@" --prune-build-cache
+  if "$@"; then
+    if [ "${MDD_PRUNE_BUILD_CACHE:-0}" = 1 ]; then
+      info "removed superseded MDD images and dangling legacy build cache"
+    else
+      info "removed superseded MDD image tags and dangling images"
+    fi
+  else
+    warn "could not remove every superseded MDD image or cache record; services remain healthy"
+  fi
 }
 
 # ------------------------------------------------------------------ subcommands
 cmd_install() {
   need_root
-  # Release assets carry this one-transition marker only so v1.3.4 can hand off safely.
-  # It is not product configuration and must not remain in the installed source tree.
   rm -f "$REPO_DIR/EDITION"
   resolve_mode
   info "MDD Sim Gateway install — repo: $REPO_DIR  (mode: ${B}$MODE${N})"
-  # The engine image compiles Asterisk + pcsc-lite + the Python SWu tunnel deps from source. On
-  # low-power ARM boards (Raspberry Pi, Armbian SBCs) this first build can take 20-30 minutes —
-  # only once, since later installs reuse the built image. Warn up front so a long, quiet build
-  # isn't mistaken for a hang.
+  # Development checkouts have no CI-generated asset manifest and therefore compile from source.
+  # Warn only on that path; official release archives import the matching native image instead.
   ensure_docker
   docker_preflight
-  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 \
+      && { [ ! -f "$ENGINE_HANDOFF_MANIFEST" ] || [ "${MDD_BUILD_IMAGES:-0}" = 1 ]; }; then
     warn "the engine image builds from source (Asterisk + pcsc-lite + SWu tunnel deps). On low-power ARM"
     warn "machines this can take 20-30 minutes — this is normal, please be patient. It runs only once;"
     warn "later installs/reloads reuse the built image."
@@ -1023,6 +1283,7 @@ cmd_install() {
   else
     info "lpac already installed at $MDD_DATA_DIR/lpac/lpac"
   fi
+  prepare_release_images
   ensure_engine_image
   persist_mode "$MODE"
   if [ "$MODE" = docker ]; then
@@ -1036,6 +1297,7 @@ cmd_install() {
     run_control_local
   fi
   run_orchestrator
+  cleanup_release_artifacts
   DATA_ABS=$(data_dir_abs)
   LAN_IP="${MDD_ADVERTISE_ADDR:-$(detect_lan_ip)}"
   printf '\n'
@@ -1053,7 +1315,6 @@ cmd_install() {
 
 cmd_reload() {
   need_root
-  # See cmd_install: remove the compatibility marker after the old updater applies the archive.
   rm -f "$REPO_DIR/EDITION"
   resolve_mode
   RECREATE_ENGINES=0
@@ -1075,6 +1336,17 @@ cmd_reload() {
   ensure_singbox
   ensure_xray
   ensure_cellular_tools
+  ENGINE_IMAGE_CHANGED=0
+  if [ "$PRESERVE_ENGINES" = 1 ] && [ -f "$ENGINE_HANDOFF_MANIFEST" ] \
+      && [ -f "$MDD_DATA_DIR/update/network.json" ]; then
+    if engine_matches_checkout \
+        && { [ "$MODE" = local ] || control_image_matches_checkout; }; then
+      info "installed release images already match the handoff — preserving them"
+    else
+      handoff_release_images
+      PRESERVE_ENGINES=0
+    fi
+  fi
   if [ "$PRESERVE_ENGINES" = 1 ]; then
     docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || \
       die "--no-engines requires the existing engine image $ENGINE_IMAGE"
@@ -1083,6 +1355,11 @@ cmd_reload() {
     ensure_engine_image force
   else
     ensure_engine_image
+  fi
+  # Only a gateway in relay media mode needs the relay image. Failing to fetch this version's
+  # keeps the one in use: the update itself is not held back by an optional component.
+  if [ "$(media_mode_recorded)" = relay ]; then
+    ensure_relay_image
   fi
   if [ "$MODE" = docker ]; then
     setup_venv
@@ -1095,11 +1372,103 @@ cmd_reload() {
     run_control_local
   fi
   run_orchestrator
-  if [ "$RECREATE_ENGINES" = 1 ]; then
-    warn "engines will be re-created by the control plane on next start/provision (image updated)"
-    for n in $(engine_names); do docker rm -f "$n" >/dev/null 2>&1 || true; done
+  # A container keeps the image it was started from, so re-creating them is not optional once
+  # the image has changed — skipping it leaves every line running the previous engine while
+  # the control plane reports the new version. That mismatch is invisible from the UI and was
+  # reported as a broken feature rather than a stale image, so decide it from what actually
+  # happened instead of from a flag the operator has to know to pass. --no-engines still wins
+  # for an operator; only the release-only v1.4.1 handoff marker overrides it above.
+  if [ "$RECREATE_ENGINES" = 1 ] || [ "$ENGINE_IMAGE_CHANGED" = 1 ]; then
+    removed=0
+    for n in $(engine_names); do
+      docker rm -f "$n" >/dev/null 2>&1 && removed=$((removed + 1)) || true
+    done
+    # A disappearing container is reported as STOPPED and does not enter health recovery. A
+    # control-plane restart starts with an empty card table, so its first reader scan treats each
+    # present SIM as an insertion and starts the missing engine. Engines not removed remain alone.
+    if [ "$removed" -gt 0 ]; then
+      info "removed $removed engine container(s) built on the previous image"
+      if restart_control_plane; then
+        info "control plane restarted — present SIM lines are starting their new engines"
+      else
+        warn "could not restart the control plane; removed engines remain down until it restarts"
+        warn "run: $0 restart"
+      fi
+    fi
   fi
+  # An amd64 Docker v1.4.x bootstrap temporarily writes "local" so its immutable old updater
+  # skips the ARM64-only Control asset. resolve_mode has already selected the real Docker
+  # installation from its live container; restore that authoritative mode only after reload.
+  persist_mode "$MODE"
+  # Run cleanup from the newly applied checkout, not from the updater's staged runner.  An
+  # upgrade launched on an older version keeps executing that old runner after apply_tree, while
+  # this installer is already the target version.  Keeping cleanup here makes the first upgrade
+  # into a fixed release reclaim old images too.  Failure is best-effort: a healthy reload must
+  # not be reported as failed only because optional disk cleanup could not run.
+  cleanup_release_artifacts
   info "reload complete (data preserved)"
+}
+
+# ------------------------------------------------------------------ media mode
+# How call media reaches the lines: direct (each line publishes its RTP ports, the default) or
+# relay (one TURN relay port, nothing published by the engines). control/app/media.py does the
+# work; this runs it in the control plane's own environment and supplies the relay image.
+relay_image_ref() {
+  printf 'mdd-sim-gateway/relay:v%s' "$(tr -d '\n' < "$REPO_DIR/VERSION")"
+}
+
+media_mode_recorded() {
+  grep -q '"mode": "relay"' "$MDD_DATA_DIR/media/state.json" 2>/dev/null && echo relay || echo direct
+}
+
+# The relay is upstream coturn, unmodified (control/app/media.py pins it). An official release
+# ships it as a checksummed asset: import that here the way the other images are imported, so a
+# host that cannot reach Docker Hub still gets it. A checkout without the release manifest, or a
+# failed download, leaves it to the control plane, which then tries the release's registry and
+# upstream itself.
+ensure_relay_image() {
+  ref=$(relay_image_ref)
+  docker image inspect "$ref" >/dev/null 2>&1 && return 0
+  [ -f "$ENGINE_HANDOFF_MANIFEST" ] && grep -q "mdd-sim-gateway-relay-" "$ENGINE_HANDOFF_MANIFEST" \
+    && have python3 || return 0
+  set -- python3 "$REPO_DIR/host/mdd_update.py" --repo "$REPO_DIR" --data "$MDD_DATA_DIR" \
+    --version "$(tr -d '\n' < "$REPO_DIR/VERSION")" \
+    --repository "${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}" --install-relay-image
+  [ -f "$MDD_DATA_DIR/update/network.json" ] && \
+    set -- "$@" --network-config "$MDD_DATA_DIR/update/network.json"
+  if "$@" >/dev/null; then
+    info "imported the media relay image $ref from the Release"
+  else
+    warn "could not import the media relay image from the Release; the control plane will try the registries"
+  fi
+}
+
+media_cli() {
+  if [ "$MODE" = local ]; then
+    ( cd "$REPO_DIR/control" && MDD_DATA="$(data_dir_abs)" MDD_HOST_DATA="$(data_dir_abs)" \
+        MDD_ENGINE_IMAGE="$ENGINE_IMAGE" "$VENV_DIR/bin/python" -m app.media "$@" )
+  else
+    docker exec -w /app/control "$CONTROL_NAME" python -m app.media "$@"
+  fi
+}
+
+cmd_media() {
+  need_root
+  resolve_mode
+  control_running || die "the control plane is not running; start it first ($0 start)"
+  # shellcheck disable=SC2086
+  set -- $ARGS
+  sub="${1:-status}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    status) media_cli status ;;
+    relay)
+      ensure_relay_image
+      media_cli relay "$@" || exit 1
+      info "open UDP and TCP on the relay port in any firewall or router in front of this host" ;;
+    direct) media_cli direct "$@" ;;
+    *) die "usage: $0 media [status | relay [--port N] [--bind ADDR] [--public-host HOST] [--public-port N] | direct]" ;;
+  esac
 }
 
 cmd_start() {
@@ -1184,6 +1553,7 @@ cmd_uninstall() {
   info "removing native control plane (if any)…"
   remove_control_local
   remove_orchestrator
+  remove_mms_at_port_rule
   if [ -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf ]; then
     rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1192,6 +1562,8 @@ cmd_uninstall() {
   info "removing MDD containers…"
   if managed_control_exists; then docker rm -f "$CONTROL_NAME" >/dev/null; fi
   for n in $(engine_names); do docker rm -f "$n" >/dev/null 2>&1 || true; done
+  if docker_container_owned "$RELAY_NAME"; then docker rm -f "$RELAY_NAME" >/dev/null 2>&1 || true; fi
+  docker network rm "$MEDIA_NETWORK" >/dev/null 2>&1 || true
   if [ "$PURGE" = 1 ]; then
     # Full teardown: also drop images (incl. the slow, patched engine image) and data+venv.
     info "removing MDD images…"
@@ -1376,6 +1748,10 @@ cmd_reset_admin() {
   mkdir -p "$(dirname -- "$backup")"
   mv "$auth_file" "$backup"
   chmod 600 "$backup" 2>/dev/null || true
+  # Client app tokens were issued by the old administrator; a reset is usually because a phone
+  # or the password was lost, so none of them may outlive it (the control plane also refuses
+  # them while no administrator is configured, and revokes them when a new one is set up).
+  [ -f "$MDD_DATA_DIR/clients.json" ] && rm -f "$MDD_DATA_DIR/clients.json"
   info "administrator account reset; previous credential file preserved at $backup"
   info "open the WebUI to create a new administrator account"
 }
@@ -1658,13 +2034,16 @@ usage() {
 ${B}MDD Sim Gateway installer${N}
 
   $0                      auto: install if absent, else show status + control menu
-  $0 install [--mode local|docker]   build + run (default mode: local)
+  $0 install [--mode local|docker]   install + run (Release assets when available)
   $0 reload  [--mode local|docker] [--no-cache] [--engines]   rebuild + restart (keep data)
   $0 start | stop | restart          control-plane lifecycle (systemd or docker per mode)
   $0 enable-autostart     start on boot
   $0 disable-autostart    do not start on boot
   $0 uninstall [--purge]  remove MDD containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
+  $0 media [relay [--port N] [--public-host HOST] | direct]
+                          show or switch how call media travels: direct (default, each line
+                          publishes its RTP ports) or relay (one TURN port, default 8478)
   $0 diagnose             print a masked card-path report (readers, bridges, lpac, logs)
   $0 reset-admin          reset the local administrator (old credential file is backed up)
   $0 logs                 follow control-plane logs
@@ -1686,6 +2065,7 @@ ${B}Modes:${N}
 
 Env: MDD_MODE(=local) MDD_PORT(=$MDD_PORT) MDD_DATA_DIR(=$MDD_DATA_DIR)
      MDD_ADVERTISE_ADDR(auto) MDD_BIND(=$MDD_BIND) PCSC_VERSION(=$PCSC_VERSION)
+     MDD_BUILD_IMAGES(=0; set 1 to force source builds)
 EOF
 }
 
@@ -1721,6 +2101,7 @@ case "$CMD" in
   disable-autostart)  cmd_disable_autostart ;;
   uninstall)          cmd_uninstall ;;
   status)             cmd_status ;;
+  media)              cmd_media ;;
   diagnose)           cmd_diagnose ;;
   reset-admin)        cmd_reset_admin ;;
   logs)               cmd_logs ;;

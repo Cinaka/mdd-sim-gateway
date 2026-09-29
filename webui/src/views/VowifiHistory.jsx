@@ -12,7 +12,8 @@ const STATE_LABEL = {
 // Short labels for the status machine's reason codes — the cause a down segment began with.
 // An unmapped code falls back to itself rather than hiding information.
 const REASON_LABEL = {
-  no_card: 'SIM status unavailable', pin_wrong: 'PIN incorrect', pin_blocked: 'PIN blocked (PUK required)',
+  no_card: 'SIM status unavailable', wrong_card: "Reader holds another line's SIM",
+  pin_wrong: 'PIN incorrect', pin_blocked: 'PIN blocked (PUK required)',
   pin_required: 'PIN required', epdg_unresolved: 'ePDG address unresolved',
   tunnel_network: 'Server ePDG did not answer IKE',
   tunnel_child_rekey_timeout: 'Server ePDG did not answer CHILD_SA rekey',
@@ -124,19 +125,30 @@ export default function VowifiHistory({ instanceId, subscribe, compact = false }
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
   const [hover, setHover] = useState(null)
+  const requestGeneration = useRef(0)
 
   const load = useCallback(() => {
+    const generation = ++requestGeneration.current
     if (!instanceId) return
     api.lineAvailability(instanceId)
-      .then(result => { setData(result); setError('') })
-      .catch(err => setError(err.message))
+      .then(result => {
+        if (generation !== requestGeneration.current) return
+        setData(result); setError('')
+      })
+      .catch(err => {
+        if (generation !== requestGeneration.current) return
+        setError(err.message)
+      })
   }, [instanceId])
 
   useEffect(() => {
-    setData(null); setHover(null)
+    setData(null); setHover(null); setError('')
     load()
     const timer = setInterval(load, REFRESH_MS)
-    return () => clearInterval(timer)
+    return () => {
+      ++requestGeneration.current
+      clearInterval(timer)
+    }
   }, [load])
 
   // Status events arrive every few seconds whether or not anything changed. Only a real

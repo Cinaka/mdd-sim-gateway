@@ -2,7 +2,1218 @@
 
 All notable changes follow Keep a Changelog and Semantic Versioning.
 
-## [Unreleased]
+## [1.13.0] - 2026-09-29
+
+The automatic update channel stays on 1.9.5.
+
+### Upgrade notes
+
+- **Updating from v1.12.0 still needs about 6 GiB free.** That figure is checked by the updater
+  in the release being updated from; from 1.13.0 on, later updates ask only for what the
+  release's images need. On a small SD card, remove older images first (Settings, "Clear old
+  and rollback images").
+- **Behind a reverse proxy that rewrites `Host` -- nginx does by default -- live updates and
+  the softphone stop after this upgrade** until the proxy keeps the host name the browser used.
+  For nginx add `proxy_set_header Host $http_host;` to the gateway's `location` (not `$host`,
+  which drops a port other than 443 and is refused just the same); for any other proxy, either
+  keep `Host`, or list the proxy under Settings → Security → Trusted reverse proxies and have it
+  send `X-Forwarded-Host`. The WebUI shows a banner saying so when it happens. Direct
+  access and proxies that keep `Host` (Caddy, Traefik and Cloudflare do) need nothing.
+- **The control image gains one Python package**, `phonenumberslite`, which the address book
+  uses to tell two spellings of one number apart from two different numbers. It is the
+  pure-Python Apache-2.0 port of Google's libphonenumber without the geocoding and carrier data
+  (about 5 MB installed instead of 46 MB), with no dependencies and no native code. It comes
+  with the new control image; nothing needs installing on the host.
+- **The control plane gains two Python packages**, Pillow and pi-heif (the decode-only build of
+  pillow-heif), for converting MMS pictures on the gateway. The control image carries them; on
+  a host install `install.sh reload` installs them from prebuilt wheels (amd64 and arm64), and
+  a host that reloads offline needs them available first. A reload that cannot install
+  them, or that installs them but cannot import them, stops before anything is restarted
+  rather than coming up with picture conversion silently off.
+
+### Added
+
+- **Line offline and recovery notifications.** A line that stays offline longer than a
+  threshold (10 minutes by default, 1-1440 on the Notifications page) sends `line_offline` once,
+  with the reason, and `line_recovered` when it registers again. Lines switched off, drafts and
+  devices with VoWiFi off do not count; several lines crossing the threshold together make one
+  message. Before this a line could stay down for hours with no notice at all.
+- **The Quectel EC20 (`05c6:9215`) is recognised out of the box**, and built-in models now also
+  reach installations whose saved hardware list predates them (a saved entry for the same
+  vid/pid still wins). The container stack read hardware settings from the wrong place, so saved
+  models and names never applied there; it now reads `settings.hardware`.
+- **Experimental: add a modem the gateway does not know.** The Devices page lists unrecognised
+  USB devices that look like modems; "Try this device" finds the AT port and checks SIM access
+  with `AT+CSIM` before adding it, instead of editing `config.yaml` by hand.
+- **Messages are marked read.** A conversation with something new shows how many, and opening
+  it clears that. The position is recorded as a message id rather than a time, because an
+  inbound SMS carries the network's own timestamp and a delayed one can be older than a message
+  already read; ids follow arrival, which is what "new" means here. Messages shows the total on
+  its menu entry and can mark a whole line read. Everything already stored when this version is
+  installed counts as read, so an upgrade does not present years of history as unread.
+- **An address book.** Contacts can be added by hand or imported from a vCard (.vcf) or CSV
+  export, and exported in either format. Two spellings of one number are recognised as one by
+  reducing both to E.164 -- `+44 7700 900123`, `07700 900123` and `00447700900123` are the
+  same contact -- using the country of the SIM the number arrived on. With SIMs from several
+  countries, each line reads a nationally written book the way a phone holding that SIM would,
+  and a number is never matched through another line's country. A number that only means something where it was dialled, such as a short
+  code or a subscriber number with its area code left off, is deliberately left alone: local
+  `10000` is not one destination everywhere, and a SIM carries a country but never an area
+  code. Android's vCard 2.1 (quoted-printable names), iOS, iCloud and Google exports are read
+  as they are written. An import adds every entry as it is written and skips only an exact
+  copy of one already there, so importing an export twice does not double the book; a contact
+  that cannot be read is reported by name rather than dropped in silence. A CSV export is safe to open in a
+  spreadsheet.
+  Conversations, the call log and the incoming-call overlay show the name instead of the
+  number once it is known.
+- Optional relay media mode for call audio: a single built-in TURN relay container carries media
+  for every line instead of each engine publishing its own RTP ports. Switch with
+  `install.sh media relay|direct|status` on a host install, or
+  `python -m app.media relay|direct|status` inside the Control container on a full-container
+  deployment. The relay is the unmodified upstream `coturn/coturn:4.17.2-alpine`, pinned by
+  digest, shipped per architecture as a Release asset and mirrored to ghcr; it is fetched only
+  when relay mode is enabled. Direct mode (each line publishing its own ports) stays the default
+  and is unchanged. Relay mode needs nf_tables with its socket match in the host kernel. On a
+  full-container deployment it has been tested on Debian only, without a registered line, and
+  not on a Synology NAS.
+- Relay mode on older kernels (Synology DSM's 4.4), which have neither nf_tables nor its socket
+  match: the engines filter their media interface with iptables-legacy instead, IPv4 and IPv6.
+  nftables is still tried first, and a kernel that takes it runs exactly the rules it did
+  before; enabling checks the path that will actually be used and is refused, as before, only
+  when neither loads. Without the socket match the fallback can admit only the RTP port range,
+  so it does not tell the browser leg from the carrier leg: on an IPv4 PDN the carrier leg's
+  RTP is reachable through the relay, though only with valid TURN credentials, where direct
+  mode exposes the same ports with none. AMI, SIP and the WebSocket stay outside the range and
+  blocked. `python -m app.media status` and `/api/media` say which filter is in use and whether
+  it tells the two legs apart.
+- Client apps can sign in with the administrator's credentials and receive a long-lived bearer
+  token (`POST /api/auth/client/login`). A token is shown once and stored only as a digest,
+  expires after 90 days without use, and ends when the administrator revokes it
+  (`DELETE /api/auth/clients/{id}`) or changes the password. With it an app may use a line's
+  texts, MMS, calls, voicemail and softphone relay, the address book and read marks; every
+  other route is refused to it, and routes added later stay refused until they are listed in
+  `authz.py`. It sees each line's name, number and state -- wherever a line's status appears,
+  without the diagnostics -- and its live event socket carries only its lines' messages, calls,
+  voicemail and state, not host, hardware or engine events.
+
+### Changed
+
+- **MMS pictures are converted and shrunk on the gateway, not in the browser.** An attachment is
+  uploaded as soon as it is added; the gateway checks it, converts HEIC/HEIF, WebP, BMP and AVIF
+  to JPEG, and shares the line's size limit between the pictures, each re-encoded from its
+  original at the largest size (up to 1600 px) and then the highest quality that fits. The
+  composer shows each attachment's size before and after and the packaged total against the
+  limit. A picture phones show that already fits and is no larger than 1600 px keeps its
+  pixels; every picture sent loses its EXIF, XMP, IPTC or PNG text, so a photo no longer tells
+  the recipient where it was taken. The original is kept only while the
+  message is being written; the sent message stores what was sent. Clients using the API get
+  the same conversion when they send files directly, or can stage them with the new
+  `/mms/attachments` endpoints. Sound, video and animated GIFs are sent as they are (video
+  conversion can be added later as another converter).
+- Picture conversion is held to the memory the gateway has. Pictures are decoded in worker
+  processes, each shrunk to 1600 px as soon as it is decoded and kept that way while the
+  message is written, so editing the text re-encodes without decoding again. A decode starts
+  only when its cost, estimated from the header, fits the budget: several at once where there
+  is memory (up to `MDD_MMS_CONVERT_WORKERS`, default the CPUs), one after another where there
+  is not. A JPEG too large to decode whole within `MDD_MMS_CONVERT_MEMORY` (default: worked
+  out from the control container's `mem_limit`) is sent smaller and marked so in the composer;
+  a HEIC that large is refused with the reason. A worker that runs out of memory anyway is the
+  one the kernel stops, not the control plane. Uploads over 1 MB are spooled under the data
+  directory, not the container's 32 MB `/tmp`.
+- With several attachments the sender chooses between one MMS, whose attachments share the
+  line's per-MMS limit, and one MMS per attachment, each fitted to the whole limit (text and
+  subject go with the first; they are submitted in order).
+- MMS attachments are checked by content against one capability table (send / convert /
+  receive-only) that the MMS settings API returns as `formats`, with an `attachable` flag the
+  WebUI follows for its picker, paste and drag-drop. Unsupported codecs (such as HEVC video),
+  vCard 4.0 and files whose content does not match their declared kind are refused with the
+  reason when they are added.
+- A received part the browser cannot show is offered as a download marked "Preview not
+  available".
+- The engine image now includes nftables, which relay mode uses to filter each line's media
+  interface, and iptables-legacy, its fallback on kernels without nf_tables (about 0.3 MB; the
+  xtables extensions it uses already come with nftables). An update therefore rebuilds every
+  engine image.
+- **One `;user=phone` setting on the line form instead of two.** The call-only request-URI
+  parameters replace the old endpoint-wide checkbox, which also put `;user=phone` on SMS. The old
+  checkbox is shown only on a line where it was turned on by hand, labelled as the older setting,
+  so it can be turned off. O2 (234-10) keeps the endpoint-wide default its SMS has always used,
+  and its form now shows the call option on with `user=phone`.
+- **A long SMS completed by a late part says so, and is pushed again whole** (#193). A text
+  still missing parts after three minutes is shown and pushed with `[…]` for the gap; a part
+  that arrives later (up to an hour) completes it where it is. It keeps its place, its time and
+  its read state, and now carries a "Completed" mark with the time, stored with the message so
+  a reloaded page and a native client show it too. Once the last part is in, the whole text is
+  pushed once more, opening with "（补全）" so it reads as the rest of the first push rather
+  than a new message -- for anyone who reads only the push, the missing part may have been the
+  code they were waiting for.
+
+### Fixed
+
+- On the container stack, texts, calls and tunnel events from the lines never reached the WebUI
+  on an installation migrated from a host install: a saved `manager_url` pointing at the host
+  won over the container address, and the engines could not reach it. The container address
+  now wins there, and a delivery that fails is logged by the engine.
+- On the container stack, the browser softphone could not connect to a line going out directly
+  after it re-rendered its configuration: the softphone WebSocket was bound to the uplink
+  address. It is now bound on the Engine network (#195).
+- On a host install (local mode), switching on a country exit took the host's DNS: the exit's
+  tun interface registered itself as the default DNS route, so the host resolved nothing. The
+  exit interfaces are kept out of the host's DNS.
+- **Outgoing calls on T-Mobile US and MVNOs on its IMS core (310-240, such as Ultra Mobile).**
+  The network refused every call to a US number with 500 "CC_IMS_TRY_NEXT_MGCF_FAIL" because
+  the request URI lacked `;user=phone` (#114). A line can now add request-URI parameters to its
+  outgoing calls (line settings → SIP), and 310-240 lines add `user=phone` by default. Only the
+  call carries them; SMS is sent exactly as before, and every other carrier's lines are
+  unchanged unless the setting is switched on. Numbers are dialled as typed, `+` included.
+- **Every incoming SMS no longer ends in a failed SIP request.** Besides handing the text to the
+  manager, each engine forwarded it to the browser softphone as a SIP MESSAGE, which the
+  softphone has no handler for and answered with 405 Method Not Allowed. The WebUI shows texts
+  from the manager's store, so the forward is gone; nothing that was visible changes.
+- On the container stack, the browser softphone had no audio on a line behind a country exit.
+  Such a line is only on the internal Engine network, and Docker publishes no port there, so its
+  RTP ports were never reachable. Control now runs a small `mdd-sim-gateway-rtp-forward`
+  container from its own image that publishes those ranges and relays UDP to the line. The
+  Engine's networks and routes are unchanged, so nothing it sends can bypass the exit. A line
+  created before this version is forwarded once it is rebuilt (an update does that).
+- On the container stack, an EC25 on a host that gives network interfaces predictable names
+  (Debian 13 and other systemd 257 hosts call its data interface something like `wws27u1i4`
+  instead of `wwan0`) is claimed by ModemManager again. Hardware only told ModemManager about
+  interfaces named `wwan*`, so it never learned of the data port and refused the modem with
+  "Failed to find a net port in the QMI modem". Hardware now asks the kernel whether an
+  interface is a cellular one (`DEVTYPE=wwan`) instead of going by its name, reading each
+  interface once, and NetworkManager is allowed to manage `ww*` rather than only `wwan*`.
+- On the container stack, a modem ModemManager cannot claim is no longer reset every few
+  minutes for good. Each reset took that SIM's VoWiFi down for a minute or more. The resets now
+  double their spacing and stop after three, none is made while flight mode is on, and the count
+  starts over once ModemManager claims the modem.
+- In the installer's docker mode, `SWU_TUN_MTU` now reaches the control container, and a reload
+  or update keeps the value the running container had. Before, the container was recreated
+  without it, so the engines fell back to the default MTU and a carrier that drops fragments
+  never answered registration. `SWU_TUN_MTU=default ./install.sh reload` drops a carried-over
+  value, and a value outside 1280–1500 is ignored with a warning.
+- A modem that ModemManager put in state "failed" (seen as `unknown-capabilities` after
+  ModemManager restarted mid-probe) is no longer asked to enable every cycle and left marked
+  as starting. The orchestrator reboots the module when that can help, after a minute and at
+  most three times, spaced out, and not while flight mode is on, where the reboot would only
+  interrupt VoWiFi. The cellular badge says what happened, and VoWiFi, which
+  keeps working through the SIM bridge, is no longer shown as starting.
+- **A container update no longer asks for 6 GiB free.** The figure was fixed, sized for the
+  images before they were slimmed, and refused a Raspberry Pi with 5.1 GiB free for an update
+  whose arm64 archives total about 530 MB. It is now worked out from this release's archive
+  sizes -- staging must hold every archive, Docker's image store every archive and its
+  unpacked image -- with 4 GiB when the Release does not report sizes, and a refusal says how
+  much is needed and how much is free. The check runs in the release being updated from, so it
+  takes effect from the update after this one.
+- **A successful container update removes the releases before the one it replaced.** Only
+  the new release and its rollback are kept, besides anything a container uses and the host
+  install's `latest`/`trusted` images; before, every release's images stayed until someone
+  pruned them by hand.
+- **A line on a card reader follows its SIM to whichever reader holds it.** Switching the eSIM
+  in a reader to a profile last used in another reader started that profile's line with the
+  old USB port: the engine found no reader there, fell back to one holding another line's card,
+  refused to authenticate, and retried every minute until the line was saved again. Every
+  start now rebinds such a line to the reader the card monitor sees its SIM in, as modem lines
+  already were. No card is read to find it.
+
+### Security
+
+- WebSocket handshakes pass the same authentication as the API, in one middleware, so a socket
+  added later cannot be left open by forgetting a check. A socket signed in with the session
+  cookie must also come from the gateway's own page: its `Origin` has to match the host the
+  browser asked for, or the forwarded host from a trusted reverse proxy.
+- Signing out, changing the password or revoking a client app now also closes the event and
+  softphone sockets opened with that sign-in; before, they stayed connected until they dropped.
+- `install.sh reset-admin` now ends every sign-in made with the old account: browser sessions
+  and client app tokens stop working at once, and setting up a new administrator starts with
+  nobody signed in. Before, a session or token issued by the reset account kept working.
+- The administrative audit log records who acted: `admin`, `client:<id>`, `engine` or
+  `anonymous`.
+
+### Removed
+
+- The silent fallback for WebUI tabs older than the first public release, which kept a
+  signed-out event socket open instead of closing it with 4401.
+
+## [1.12.0] - 2026-09-26
+
+First release with the full-container deployment. The automatic update channel stays on 1.9.5.
+
+### Added
+
+- Full-container deployment on any Linux host with Docker Compose, including Synology NAS: three
+  base containers plus one Engine per line, one-click update with whole-stack rollback, amd64 and
+  arm64 images, a version-pinned Compose file, and a Synology DS1621+ driver pack. Validated on a
+  DS1621+ and a Raspberry Pi.
+- Modem VoLTE / IMS switch; detection of carriers without Wi-Fi Calling; cellular call audio
+  detection.
+
+### Changed
+
+- Separate 4G and VoWiFi badges in the device list; lower idle CPU on a Raspberry Pi.
+
+### Fixed
+
+- SIMs that grant a single logical channel; modems ModemManager gave up on; modem readers under an
+  unprivileged pcscd; MMS uploads cut short; Messages on a phone; a stale WebUI after an upgrade;
+  SIM fields missed on the first read.
+
+## [1.11.0] - 2026-09-22
+
+### Fixed
+
+- VoWiFi registration no longer becomes stale after a tunnel or P-CSCF change. P-CSCF updates
+  restart Asterisk cleanly instead of reloading `res_pjsip` through an unsafe credential lifetime;
+  the carrier-granted expiry is taken from this line's own Contact even when the response also
+  lists a stale binding; and a slow or missing SIM authentication answer gets ten seconds and a
+  bounded retry instead of leaving the line falsely shown as registered for up to an hour.
+- MMS composition now generates valid SMIL with unique references, measures the fully packaged
+  request against the carrier limit, and stores received parts under safe internal names. File and
+  database changes switch atomically, so a failed save cannot leave rows describing overwritten
+  content. Conversations open at the newest message and keep following it until the reader scrolls
+  up.
+- Migration and full local backups now include the MMS files referenced by their history snapshot.
+  A file that was already absent is reported without making all future backups impossible, while a
+  file that existed but was omitted from the archive still fails the backup.
+- Plain Asterisk hangup handlers no longer emit `Return without Gosub` on every call. Call records
+  now say whether the carrier, local endpoint, or gateway ended the SIP dialog first, and support
+  bundles include redacted Asterisk WARNING/ERROR lines needed to distinguish media and SDP faults.
+- The softphone WebSocket relay now closes an engine connection if the browser handshake fails,
+  and reports temporary unavailability (`1013`) when Docker cannot inspect the engine. Its
+  `websockets` dependency keeps Python 3.10 support while requiring the proxy-disable option used
+  by the relay.
+
+### Changed
+
+- VoWiFi settings and line details now name ESP rekeying as the data-channel rekey and IKE
+  rekeying as the control-channel rekey. A zero data-channel interval distinguishes a rekey
+  initiated by the carrier from a rekey that is off; this is a label-only change.
+- The browser softphone now connects to the same address as the WebUI, at
+  `/api/instances/<line>/softphone/ws`, and the control surface relays it to that line's engine
+  over the Docker bridge. Engines no longer publish a WSS port (8089, 8099, ...) to the host, no
+  longer need a TLS certificate mounted, and their SIP WebSocket no longer listens on the VoWiFi
+  tunnel's address. A second certificate exception for the softphone port is gone, and a reverse
+  proxy only has to forward WebSocket upgrades for the WebUI's own address -- a separate
+  `location` pointing at the engine port is no longer needed. RTP media ports are unchanged.
+
+## [1.10.0] - 2026-09-18
+
+### Upgrade notes
+
+- **Modem SMS storage is not emptied on upgrade.** This version can delete an SMS from the
+  modem/SIM once it is safely in the database (`delete`), which is what keeps the small modem
+  storage from filling up and blocking new texts. An installation upgraded from an earlier
+  version gets `settings.cellular_sms_storage: keep` written into its configuration on first
+  start, so nothing on the modem changes by itself; new installations default to `delete`.
+  To opt in, set `cellular_sms_storage` to `delete` (or `when_full`) under `settings`, or
+  `MDD_CELLULAR_SMS_STORAGE` in the control service environment when the setting is absent,
+  and restart the control service. Anything still stored on the modem is imported first and
+  then removed.
+- **The history database is migrated in place, including deletions.** Duplicate inbound
+  messages (the same text imported more than once, or received over both VoWiFi and the modem)
+  are folded into one, and the `--` rows 1.9.3 stored for an unreadable body are removed. Each
+  step is transactional and runs once. Before the first step runs, a verified copy of the
+  database is written to `backups/` in the data directory (never removed automatically); if
+  that copy cannot be made, the control plane stops without migrating anything and says why. MMS notifications that earlier versions filed among the non-text
+  payloads are decoded again from their stored PDU: each becomes the MMS it announced, or is
+  dropped as a copy of one already in its conversation, and leaves the payload list. Rolling
+  back to an earlier version keeps working; returning to this version afterwards repairs what
+  the older version left, including notifications it filed again.
+- **Sending MMS over a modem restarts ModemManager once during installation** to release the
+  module's secondary AT port (see TROUBLESHOOTING, MMS).
+
+### Added
+
+- The Messages page shows MMS: pictures inline, audio and video players, other attachments
+  as downloads, and a Download/Retry button for an MMS that is not downloaded yet. Attaching
+  files to a message sends it as MMS -- through the attach button, or by pasting a screenshot or
+  copied picture into the message box, or by dropping files onto it; pictures are scaled down in the browser to fit the line's
+  size limit. An "MMS settings" dialog shows the detected carrier settings and lets each line
+  override them or turn auto-download off.
+- MMS can be sent: text, pictures, audio, video or contact cards to one or several
+  recipients, with a delivery report shown on the message when the carrier sends one. The
+  size limit is per line (300 KB by default). Over the modem this needs an AT port the gateway
+  owns: the installer adds a udev rule releasing the port ModemManager classifies as a Quectel
+  module's secondary AT port (the primary one and QMI stay with ModemManager, and a module with
+  a single AT port is left alone), and the gateway finds that port on each modem by itself (or
+  takes `MDD_MMS_AT_PORT`). A 100 KB MMS then uploads in about three seconds, and lines on
+  different modems send and download in parallel. Without it only retrievals go over the modem, because ModemManager
+  relays the module's upload command at about 100 bytes a second -- slow enough for the MMSC
+  proxy to give up, and each chunk counts toward ModemManager's limit of consecutive timeouts
+  after which it drops the modem. A send whose answer is lost is marked unknown and never
+  repeated automatically.
+- Received MMS are downloaded and shown: text, pictures, audio and video, in the sender's
+  conversation, and a push notification carries the text once it is known. A carrier's MMSC
+  normally answers only on its MMS APN, so a modem with Quectel's embedded TCP/IP stack opens
+  that APN inside the module for the duration of one exchange, leaving the host's own data
+  connection and routing untouched (this uses ModemManager's command channel, i.e. `--debug`,
+  as the SIM bridge already does). Where the MMSC is reachable from the host's network, the
+  line can use the host instead. The MMS APN, MMSC and proxy are looked up from the
+  `mobile-broadband-provider-info` database by the SIM's network code and can be set per line.
+  A failed download is retried with backoff until the notification expires; auto-download can
+  be turned off per line, and any MMS can be downloaded or retried by hand.
+- An MMS notification is recognised and kept as a pending MMS in its conversation, from
+  VoWiFi and from the modem alike. 1.9.4 looked for the text `application/vnd.wap.mms-message`
+  in the payload, but carriers send that content type as its one-byte binary code, so real
+  notifications were never matched: over VoWiFi they piled up among the non-text payloads and
+  on the modem they stayed in storage. A notification now becomes one MMS per MMSC location,
+  however many times and over whichever transport it arrives, and a WAP Push too long for one
+  SMS is reassembled first. Delivery reports for sent MMS are applied to the message they
+  belong to. `drop_mms_wap_push` is gone: the modem object is removed by the storage policy
+  once the notification is stored.
+- Modem SMS storage can be emptied as messages are imported. The gateway only ever read the modem's
+  SMS objects, so its storage (23 slots on a typical module, a few more on the SIM) filled up and
+  the modem then stopped accepting texts altogether. An object is now deleted once its message
+  is safely in the database -- checked again right before deleting, so a message that was not
+  imported can never be removed. `MDD_CELLULAR_SMS_STORAGE` (or `settings.cellular_sms_storage`)
+  selects `delete` (default for new installations), `when_full` (keep objects, remove the
+  oldest imported ones only when fewer than three slots remain) or `keep` (written for upgraded
+  installations; see Upgrade notes).
+
+### Fixed
+
+- An SMS no longer appears twice. A text still held by the modem was imported again every time
+  ModemManager restarted, because the import marker was tied to the modem's object number, which
+  restarts from zero with the daemon; and a SIM registered both over VoWiFi and on its modem is
+  often sent the same text over both, which showed as two identical messages. Every message now
+  has an identity that does not depend on where it came from -- sender, text and the network's
+  own timestamp -- and a copy arriving over the other transport within three minutes is
+  recognised as the same message. Identities belong to the SIM (its ICCID, or IMSI where the
+  modem exposes no ICCID) rather than to the line slot, so re-adding a SIM under a new line
+  does not bring back what its modem still holds, and another SIM given a reused line id starts
+  clean. Network timestamps are converted to absolute time independently of the host's time
+  zone, including ModemManager's hours-only zone suffix that older Python versions could not
+  parse. Duplicates already in the history are folded once on upgrade,
+  together with the `--` placeholder rows 1.9.3 stored for an unreadable body. A message you
+  delete stays deleted even if the modem still holds it.
+- A VoWiFi SMS is dated by the network's timestamp, like one received on the modem, instead
+  of the moment the gateway happened to process it. A multi-part text takes its first part's
+  time, which is also what ModemManager reports for the assembled copy.
+
+## [1.9.5] - 2026-09-15
+
+### Fixed
+
+- A browser with no microphone can place and answer calls again, and says what it is doing.
+  JsSIP's first step is `getUserMedia`, so on a PC with no audio input the call died about ten
+  milliseconds after the click with no INVITE ever sent -- and because JsSIP reports every
+  media failure as one generic cause, the screen showed only "Call ended", which reads as a
+  carrier problem. WebRTC needs a local track, but not a microphone: the call now goes out on
+  a silent one, so the carrier is still heard -- which is the whole point of dialling a
+  voicemail box, a service code or an announcement. The dialler says so while idle, the call
+  screen carries a "listen only, the other side cannot hear you" line for the whole call, and
+  Mute is not offered on a track that is already silent. The same fallback applies to
+  answering an incoming call. The Call button also reads the registration indicator it already
+  draws, instead of sending an INVITE into a websocket that is not connected
+  ([#90](https://github.com/MddIdd/mdd-sim-gateway/issues/90)).
+
+## [1.9.4] - 2026-09-12
+
+### Added
+
+- A line can present its own SIP User-Agent, set under Advanced IMS identity. Carriers that
+  gate IMS registration on a terminal whitelist answer 403 to an unrecognised User-Agent, and
+  configuring the IMEI does not help -- that value only reaches the ePDG's DEVICE_IDENTITY.
+  Left empty a line still identifies as `MDD-Sim-Gateway`. The value is rendered into
+  `pjsip.conf`, so it is reduced to a single line of printable ASCII and capped at 64
+  characters ([#83](https://github.com/MddIdd/mdd-sim-gateway/issues/83)).
+
+### Fixed
+
+- A multi-part SMS is no longer imported twice, the first copy reading `--`. `mmcli` renders
+  the still-unassembled text of a multi-part message as its placeholder `--`, and the receive
+  scanner stored that as a body; when the remaining parts arrived the assembled text was
+  imported again as a separate message, because the import fingerprint covers the body. The
+  placeholder and ModemManager's `receiving` state now both count as "no readable text yet"
+  ([#84](https://github.com/MddIdd/mdd-sim-gateway/issues/84)).
+- A carrier MMS notification is deleted from ModemManager instead of holding modem/SIM SMS
+  storage indefinitely. It arrives on the SMS channel as a WAP Push carrying no readable text
+  and a binary WSP payload, so a gateway that never retrieves MMS can neither show nor forward
+  it and nothing else ever consumes it; on a SIM that receives them regularly the storage
+  eventually fills and no new SMS can arrive. Recognition requires both an unreadable text and
+  the standard `application/vnd.wap.mms-message` marker, so it keys on no carrier's sender
+  number, SMSC or MMSC host. Set `drop_mms_wap_push: false` under `settings` to keep the raw
+  objects ([#85](https://github.com/MddIdd/mdd-sim-gateway/issues/85)).
+
+## [1.9.3] - 2026-09-11
+
+### Fixed
+
+- An AMI connection that was refused no longer leaves its manager pinging a transport that
+  never opened. panoramisk schedules a pinger and a reconnect timer as soon as a manager is
+  created and the event loop keeps the object alive through them, so a failed connect logged
+  a send failure once per ping interval for as long as the control plane ran. Restarting the
+  control plane while the engine containers are still starting -- what an upgrade does --
+  was enough to trigger it.
+- Cellular SMS and calls can match a line by IMSI when ModemManager cannot read that SIM's
+  ICCID. A readable but different ICCID still fails closed instead of falling back to IMSI.
+- ML307X VoWiFi lines keep their allocated PIN, SWu and IMS reader slots across profile
+  switches, ignore extra unallocated VPCD readers, and retain a configured line IMEI when
+  the modem does not expose one live. Reselecting ADF.USIM after an IMSI-bound reader match
+  no longer calls an undefined helper, and now goes through the shared APDU exchange, so a
+  TPDU-level reader's `61xx` response is fetched rather than left pending for the next
+  command ([#74](https://github.com/MddIdd/mdd-sim-gateway/pull/74)).
+- `SWU_TUN_MTU` set on the control plane now reaches the engine containers it starts. The
+  engine has always read that variable to fix the `ipsec0` MTU, but a managed container was
+  given only its instance id and liveness period, so lowering the MTU for a carrier that
+  fragments changed nothing on any line the control plane started
+  ([#79](https://github.com/MddIdd/mdd-sim-gateway/pull/79)).
+- Installation now pulls in `mobile-broadband-provider-info`. A modem profile falls back to
+  `gsm.auto-config yes` when no bearer APN is visible, and that lookup reads the provider
+  database; without the package NetworkManager had no APN to dial, so cellular data could
+  not come up on a fresh install ([#80](https://github.com/MddIdd/mdd-sim-gateway/pull/80)).
+
+## [1.9.2] - 2026-09-08
+
+### Fixed
+
+- Missing tunnel evidence and local DNS, SIM, protocol or engine failures no longer count as
+  failed exit nodes. Unknown evidence does not trigger node changes or stalled-session cleanup,
+  and notifications no longer claim a clean tunnel when that has not been established.
+  Only a tunnel that went unanswered on the network (`tunnel_network`) with readable IKE
+  evidence now blames the exit. An ePDG that refuses the line before any EAP-AKA challenge
+  (`tunnel_not_authorized`), a setup failure with no clear cause, and a rekey that timed out
+  before the line had been stable for ten minutes are treated as inconclusive: the line keeps
+  rebuilding on its current exit and reports once after repeated failures instead of walking
+  the candidate pool. Previously an authorization refusal was attributed to the exit's source
+  address and moved the node; in practice those refusals have been carrier-side decisions
+  (location headers, IMEI binding, provisioning) that no other node fixes.
+- A partial or garbled EF.ICCID read is no longer treated as the card's identity. The control
+  plane, `pin_keeper`, `ami_usim` and `swu_ike` now require the full ten BCD bytes and an
+  all-digit value of at least fifteen digits; anything shorter reads as "could not identify
+  the card". Previously a truncated read decoded into a different number and could convict a
+  correctly bound reader as holding the wrong SIM, stranding the line
+  ([#69](https://github.com/MddIdd/mdd-sim-gateway/pull/69)).
+- Direct and non-selectable routes bypass the exit ledger instead of entering an hourly
+  candidate-exhaustion retry cycle. A subscription exit whose current node is momentarily
+  unknown (the host blanks it until the Clash API answers) keeps its ledger, so a freeze in
+  that window no longer restarts the candidate walk or repeats the exhaustion notification.
+- Persisting a subscription selector's already-active node no longer restarts the shared
+  sing-box process. Actual configuration changes and process failures still trigger a restart.
+- Notification destinations run independently on a dedicated, eight-worker delivery pool;
+  HTTP retries no longer hold the default executor or serialize the configured channels.
+- Carrier identification prefers an exact PLMN, including parent-network fallback, before
+  attempting compatibility with older zero-padded two-digit MNCs.
+- VoWiFi history ignores stale request successes and failures after a newer refresh, line
+  change or unmount, and clears the previous line's error when switching lines.
+- A SIM whose ICCID ModemManager could not read is treated as unidentified instead of as a
+  line that matches nothing. `mmcli` renders an unreadable property as the literal `--`;
+  that value reached the control plane as a live ICCID, so the modem never fell through to
+  the PC/SC bridge, which can still read the card over a logical channel.
+- A modem's cellular-data profile no longer autoconnects, and no longer offers the host a
+  default route. NetworkManager dialled the profile after a reboot however the operator had
+  set that modem's cellular-data switch, and nothing kept the result from carrying the
+  default route -- which would send the VoWiFi tunnel authenticating that very SIM out
+  through the SIM's own carrier. Profiles written by earlier versions are corrected in
+  place. Set `MDD_MODEM_ALLOW_DEFAULT_ROUTE=1` where the modem genuinely is the only uplink.
+- A cellular profile left behind by an earlier version is secured even when cellular data is
+  simply switched off. Every data path is gated on the ModemManager backend being up, so the
+  state an operator reaches by turning cellular data off -- backend stood down, profile left
+  behind -- was the one state in which nothing corrected a profile that still autoconnected
+  forever.
+- Turning cellular data off now reaches a modem that reports no port. The profile was matched
+  only by the port it was attached to, so a modem in a failed or SIM-less ModemManager state
+  -- the state in which an autoconnecting profile is most likely to be dialling on its own --
+  was left running.
+- A modem that reports no IMEI keeps its published bridge identity. The record was discarded
+  whenever the module never answered the AT IMEI query, which also dropped the bridge's ICCID
+  (so the card matched no line and the reader binding never migrated) and collapsed the modem
+  to a single VPCD slot, putting PIN, SWu and IMS on one reader.
+
+## [1.9.1] - 2026-09-04
+
+### Fixed
+
+- SIMs with no PIN could be reported as PIN-locked on v1.9.0, blocking VoWiFi with a prompt for a
+  PIN the card never asked for. v1.9.0 judged each SELECT by the GET RESPONSE that follows it, but
+  `61xx` already means the card accepted the command — a card that then declines to hand back the
+  response body made `SELECT ADF.USIM` read as a failure, so card reading stopped with every PIN
+  field unset. The APDU helper now reports the command's own verdict and returns whatever body it
+  could fetch, keeping the v1.9.0 support for APDU-level readers and T=1 cards rather than trading
+  one reader class for the other. The `6Cxx` length-correction retry also no longer drops the
+  command's data field, which turned a retried case-4 SELECT into a malformed command
+  ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+- A start refused by the SIM preflight showed only "Capability change failed: Conflict" because the
+  409 carried no human-readable message. The refusal now explains itself; when a PIN really is
+  required the WebUI prompts for it and retries the start, and when the card could not be read at
+  all the error says so instead of asking for a PIN that cannot help
+  ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+- Switching an eSIM profile while a line started could be reported as a misleading "no card". The
+  preflight now compares the live-read ICCID against the line's expected ICCID instead of relying
+  only on the sampled card-monitor cache, which lags inside a profile-switch window, and reports a
+  card mismatch naming both ICCIDs ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+
+### Added
+
+- Support bundles now record why a line start was refused. A closed-schema `preflight_blocked`
+  lifecycle event (reason code plus card-present / ICCID-matches booleans, never an identifier) is
+  written for each refusal; previously the refusal happened in the control plane before any engine
+  log existed, so a bundle showed no trace of it
+  ([#60](https://github.com/MddIdd/mdd-sim-gateway/issues/60)).
+
+## [1.9.0] - 2026-09-03
+
+### Added
+
+- The country-exit picker can now be searched by Chinese or English country name and by two-letter
+  country code, with keyboard navigation for selecting a result
+  ([#53](https://github.com/MddIdd/mdd-sim-gateway/issues/53)).
+- Renaming a running SIM line now updates its display metadata without rebuilding the line's
+  IKE and Asterisk engine; edits to operational settings continue to restart the line so they are
+  actually applied ([#53](https://github.com/MddIdd/mdd-sim-gateway/issues/53)).
+- The manual update selector now offers the five most recent stable releases instead of only the
+  latest one, making recent rollback or version switching available from System Settings.
+
+### Fixed
+
+- SIM access now supports readers that expose APDU-level responses and T=1 cards across SELECT and
+  READ operations, including direct data responses, `61xx` chaining and `6Cxx` length correction.
+  Reader errors are surfaced instead of being mistaken for card data, and verified card bindings
+  remain stable across subsequent operations
+  ([#51](https://github.com/MddIdd/mdd-sim-gateway/issues/51)).
+
+## [1.8.1] - 2026-09-02
+
+### Fixed
+
+- A bare RFC 3748 EAP-Request/Identity in the first IKE_AUTH reply — how Lebara UK's (PLMN 234-87)
+  self-hosted ePDG opens EAP before any EAP-AKA exchange — was not recognised, so the attach
+  aborted with a misleading NO EAP PAYLOAD RECEIVED. The engine now answers it with an
+  EAP-Response/Identity carrying the IMSI NAI and continues into EAP-AKA. When an EAP payload is
+  present but its method is still unsupported, the error now names the received code and type
+  instead of claiming no payload arrived
+  ([#43](https://github.com/MddIdd/mdd-sim-gateway/issues/43)).
+
+- Number-keeping intervals can now be configured for up to 365 days instead of being capped at
+  90 days, covering carriers with 180-day retention policies
+  ([#40](https://github.com/MddIdd/mdd-sim-gateway/issues/40)).
+
+### Security
+
+- Updated the WebUI build dependency chain to a patched Browserslist release, resolving
+  GHSA-c83g-rgw3-j3cx and GHSA-73wf-gq98-2v4g. Production dependency auditing reports no known
+  vulnerabilities ([#42](https://github.com/MddIdd/mdd-sim-gateway/pull/42)).
+- Added a pre-push privacy hook that scans every source blob introduced by the commits being
+  published, so removing a subscriber identifier in a later commit can no longer hide it from the
+  local guard ([#38](https://github.com/MddIdd/mdd-sim-gateway/pull/38)).
+
+## [1.8.0] - 2026-09-01
+
+### Added
+
+- Feishu/Lark notifications can fan out to multiple independently configured custom bots. Each bot
+  has its own webhook, signing secret, event switches, templates, test action and optional SIM-line
+  filter. Empty filters receive every line and gateway event; filtered bots receive only matching
+  line events. Delivery retries and history remain independent per bot, and existing single-bot
+  configurations migrate automatically without duplicate sends
+  ([PR #36](https://github.com/MddIdd/mdd-sim-gateway/pull/36)).
+
+- DITO Telecommunity (PLMN 515-66) VoWiFi support, contributed in
+  [PR #35](https://github.com/MddIdd/mdd-sim-gateway/pull/35). Its ePDG answers the MODP-2048
+  proposal set with NO_PROPOSAL_CHOSEN and offers only AES-CBC-128 / HMAC-SHA1 / MODP-1024, so
+  that legacy suite is now selected for that PLMN alone — every other carrier keeps the existing
+  four proposals in the same order. The RFC 4187 identity requests DITO sends during the first
+  IKE_AUTH exchange (AT_PERMANENT_ID_REQ and AT_FULLAUTH_ID_REQ) are answered as well, instead of
+  being ignored and reported as NO EAP PAYLOAD RECEIVED.
+
+### Fixed
+
+- An RP-ACK or RP-ERROR — the SMSC reporting on a message the gateway sent — was treated as an
+  unknown message type and then handed to the dialplan anyway. Carrying no TPDU, it arrived
+  empty, so every submitted segment wrote a bodyless inbound record: one six-segment text left
+  six phantom messages behind. Reports are now recognised, answered, and stopped before the
+  dialplan, and a refusal is logged with its RP cause.
+
+- A part of a long message that arrived after its group had been flushed started a new group and
+  was published as a second, near-duplicate fragment of a message already in the thread. Between
+  two carriers the parts of one text arrived ten minutes apart, so this was the normal outcome
+  rather than an edge case. A flushed group now stays addressable for an hour and a late part
+  fills in the gap it left.
+
+- The WebRTC endpoint advertised opus, which no build of the engine image can encode: codec_opus
+  is an external, x86-only binary module, and enabling it in menuselect is silently a no-op on
+  arm64. A peer that offered opus alone got a connected call with no audio and no error. Opus is
+  no longer offered; calls continue over ulaw/alaw as they already did in practice.
+
+### Changed
+
+- The published control image and the engine image are substantially smaller: 194 MB -> 76 MB and
+  272 MB -> 143 MB compressed, 852 MB -> 355 MB and 1.04 GB -> 607 MB on disk. The control image
+  no longer ships the toolchain that built it, and the engine ships only the Asterisk modules it
+  can load, stripped, which also drops 109 packages that were pulled in by modules the engine
+  already refused to load. The documented storage requirements follow: 2 GiB free to install
+  instead of 4 GiB, 3 GiB kept free for an upgrade instead of 6 GiB, and an 8 GB rather than
+  16 GB system disk. Building the engine from source on the device is unchanged and still needs
+  several GiB more.
+
+### Added
+
+- Feishu/Lark notifications can fan out to multiple independently configured custom bots. Each bot
+  has its own webhook, signing secret, event switches, templates, test action and optional SIM-line
+  filter. Empty filters receive every line and gateway event; filtered bots receive only matching
+  line events. Delivery retries and history remain independent per bot, and existing single-bot
+  configurations migrate automatically without duplicate sends.
+
+## [1.7.0] - 2026-09-01
+
+### Added
+
+- Feishu/Lark custom bots are now a native notification channel alongside Webhook, Telegram
+  and PushPlus. Each event can be enabled separately, use its own title and content template,
+  and be tested from the WebUI. Official Feishu and Lark webhook endpoints are accepted, with
+  optional HMAC-SHA256 signing; HTTP success is also checked against the platform response so
+  rejected messages are retried and reported instead of appearing delivered. Webhook tokens and
+  signing secrets are removed from support bundles.
+
+- System Settings can now list published test Releases alongside the latest normal Release,
+  install an explicitly selected test version, and switch a test installation back to the
+  normal version without using the host command line. Drafts stay hidden, automatic updates
+  remain on the stable promotion policy, and the server resolves the selected tag again before
+  publishing the verified host update request. The page also retains the last background or
+  manual check time instead of returning to “Not checked” when it is opened.
+
+- Telegram delivery and software updates can now explicitly use a proxy-library entry or a
+  configured country exit, in addition to direct networking (and automatic fallback for
+  updates). Existing Telegram manual-proxy settings remain usable, while legacy updater manual
+  proxies migrate into the shared library and legacy country selections stay pinned.
+
+### Fixed
+
+- [Issue #33](https://github.com/MddIdd/mdd-sim-gateway/issues/33): a giffgaff/O2 UK VoWiFi
+  line dropped like clockwork every ~2h50m. The carrier silently invalidates its SWu session
+  just before a 3-hour lifetime without sending any IKE message, and the engine's proactive
+  IKE-SA rekey — the mechanism that resets that carrier clock — defaulted to 600 minutes and
+  could not be configured, so it never fired in time. The IKE rekey period is now a real
+  setting (System Settings → Calls & VoWiFi, with a per-line `ike_rekey_minutes` override)
+  and defaults to 150 minutes, which preempts every carrier clock observed so far (giffgaff
+  ~2h50m, EE ~12h). The 30-minute ESP rekey is unchanged and unrelated.
+
+- A `reg_rejected` freeze now records the SIP response code that condemned the line (for
+  example 403) in both the lifecycle record and the frozen diagnostics snapshot. The #33
+  support bundle reached us after every log line holding that code had rotated away, so the
+  bundle could prove the registration was rejected but not why.
+
+- [Issue #30](https://github.com/MddIdd/mdd-sim-gateway/issues/30): a modem bridge identity
+  refresh that temporarily failed to read IMEI could replace the already verified hardware
+  identity with an empty value. If health recovery later rebuilt the line, the restart was
+  blocked by `hardware_imei_required` and VoWiFi stayed off. A bridge now retains its verified
+  immutable IMEI across incomplete refreshes. Recovery no longer accepts a line-saved modem
+  IMEI when the live bridge cannot verify it, because modems without USB serial numbers reuse
+  the same port-derived id after a physical module swap.
+
+- Reopened [Issue #21](https://github.com/MddIdd/mdd-sim-gateway/issues/21): automatic recovery
+  decisions now survive a later VoWiFi toggle in a separate bounded lifecycle log. Redacted
+  support bundles record structured scheduling, blocking, cancellation, start failure and success
+  events without exception text or subscriber/hardware identifiers, so the final reason a rebuild
+  did not happen remains diagnosable. An enabled native-reader line also remains eligible for
+  recovery when the default for newly detected devices has VoWiFi disabled.
+
+- Support bundles now report per-file coverage and truncation, retain both the beginning and end
+  of bounded IKE segments, expose only boolean bridge identity/channel health plus metadata age,
+  and enforce a 10 MiB archive ceiling with deterministic low-priority log omission. New lifecycle
+  and bridge fields have explicit redaction and archive-content regression coverage. Unbounded
+  call history is counted but only its latest 20,000 lines are parsed for safe call evidence.
+
+- Lifecycle writes no longer block the asyncio control loop or contend with multi-megabyte
+  diagnostic rewrites. Cancellation is recorded centrally for manual starts/stops, configuration
+  restarts, eSIM switches, card removal and disabled lines; repeated identical no-card blocks are
+  coalesced so they cannot evict the useful failure history.
+
+- [Issue #27](https://github.com/MddIdd/mdd-sim-gateway/issues/27): a VLESS node using
+  Xray 26.7+ VLESS Encryption could never connect. The share link's `encryption` parameter was
+  dropped and `none` sent in its place, so the client established a connection the server could
+  not read: every request timed out, the server logged nothing, and the node was
+  indistinguishable from a dead one. The declared value is carried through to Xray now, such
+  nodes are routed to Xray automatically whether or not they use REALITY, and the sing-box
+  converter refuses them by name instead of building an outbound that silently never answers.
+  Verified against a server configured this way: unreachable before, 79 ms after.
+
+- The UDP validation probe no longer decides an exit's fate from DNS alone. VoWiFi carries IKE
+  on UDP 500/4500 and never queries a resolver, while port 53 is among the most intercepted and
+  rewritten ports there is. STUN probes now run interleaved with DNS ones on ports nobody
+  rewrites, each with its own SOCKS5 association, and any single answer passes the exit. Both
+  lists are configurable (`MDD_UDP_PROBE_TARGETS`, `MDD_UDP_STUN_TARGETS`), and a failure names
+  every probe tried with what each one did.
+
+- Xray becoming unavailable now fails only the exits it carries. Moving REALITY onto Xray made
+  it load-bearing for ordinary exits, where it had mattered only to the rare XHTTP node, and a
+  missing or crashed Xray took every country down with it — including exits that never touch
+  it. Its absence is reported as what it is, naming REALITY and how to install it.
+
+- VLESS nodes on the Xray path request XUDP packet encoding, which the XHTTP path already did
+  while the raw/ws path sent nothing — UDP is what these exits exist for.
+
+- A failed node test shows why on screen instead of behind a hover, where a vanishing toast was
+  all an operator could screenshot. The parsed summary keeps the SNI behind the
+  sensitive-information switch, since that line names the operator's own server and is the part
+  people screenshot into public issues.
+
+- Notification event switches now collapse like the message-template editor, and channel test
+  buttons show a disabled testing state while their request is running. Update-network guidance
+  is shown beneath the network selection, while release-range guidance is shown beneath the
+  update method and version range instead of the two descriptions appearing swapped.
+
+- Telegram and software-update proxy pickers no longer offer subscription profiles as if they
+  were a single route. Subscriptions remain available through explicit country exits, automatic
+  update fallback skips them, and a previously selected subscription migrates to its first
+  enabled assigned country exit so an upgrade keeps the route it used before.
+
+- A release candidate now recognizes the final Release with the same numeric version as newer
+  (for example, `1.6.1-rc2` → `1.6.1`), so promotion-gated automatic updates can move test
+  installations back onto the normal release line.
+
+## [1.6.0] - 2026-08-29
+
+### Added
+
+- Webhook, Telegram and PushPlus notifications can now override title and content per event,
+  with a shared field-only `{{variable}}` syntax, an in-page preview, per-event test delivery
+  and one-click restore. Empty templates preserve the existing wording. Standard webhooks now
+  also include rendered `title` and `content` fields, while custom webhook payloads can keep
+  using those fields inside their JSON/form/raw templates. Unknown events, properties and
+  variables are rejected when settings are saved; templates cannot evaluate expressions or run
+  code. PushPlus's existing HTML/text/Markdown/JSON selector is now labelled “content format”
+  so it is not confused with the new message templates.
+
+- Incoming VoWiFi calls now remain available for the configured answer window while the browser
+  is closed. After a call notification, signing in opens a global Answer/Decline overlay from any
+  WebUI page and automatically registers every enabled line; voicemail still begins at the same
+  configured deadline when nobody answers.
+
+- Testing an individual node now returns a redacted summary of how the gateway parsed the
+  link — protocol, transport, TLS/Reality, SNI, ALPN, obfuscation, UDP capability and which
+  engine carries it, with no address or secret — so a node that works in another client can
+  be compared field by field.
+
+### Changed
+
+- VLESS REALITY nodes now run on the bundled Xray-core instead of sing-box, over the same
+  loopback bridge XHTTP already used. REALITY's wire details move with Xray, so a server on a
+  newer Xray build could answer Xray clients while sing-box failed the handshake with
+  "reality verification failed" — a version skew the gateway no longer sits in the middle of.
+  Nodes sing-box handles correctly are untouched. The pinned Xray version stays on the newest
+  release upstream marks stable; `MDD_XRAY_VERSION` may now be overridden together with
+  `MDD_XRAY_SHA256_AMD64`/`_ARM64` for an operator who must match a prerelease server.
+
+### Fixed
+
+- Opening the Calls or Devices page during its first refresh no longer briefly claims that a
+  line is unregistered or that a known device has no SIM. The softphone now keeps its initial
+  connection state until registration produces real evidence, and device/SIM cards stay on the
+  discovery placeholder until the control plane finishes its first hardware scan.
+
+- Asynchronous WebUI data now consistently distinguishes loading, confirmed empty state and
+  request failure. First sign-in, line/device switches, call history, logs, allowance, keeping,
+  eSIM capability, proxy status, notification delivery and system settings no longer flash a
+  false “none”, “off”, “not connected” or default configuration while their APIs are pending.
+
+- [Issue #22](https://github.com/MddIdd/mdd-sim-gateway/issues/22): switching to another
+  device while a VoWiFi, cellular-data or flight-mode request was still pending could carry
+  the first device's temporary “starting/stopping” display into the second device. Capability
+  operation state is now keyed by both device and capability; the request still completes on
+  its original device, while every other device continues to show its own live state.
+
+- [Issue #26](https://github.com/MddIdd/mdd-sim-gateway/issues/26): a physical-eSIM profile
+  switch could report failure — and leave the page and device state on the previous SIM —
+  even though the eUICC had already switched. The modem bridge published the baseband's
+  cached ICCID, so the post-switch rebuild verification timed out; it now reads EF_ICCID
+  from the card itself over AT+CSIM and only falls back to the cache. When the switch
+  succeeds but line recovery still fails, the API now reports the switch with the recovery
+  error instead of a plain failure, and the UI shows the new profile as active with a hint
+  to check its line. Native card readers now retry the post-switch identity probe through
+  the eUICC REFRESH window instead of keeping the old ICCID after a single failed read,
+  and they disable the old profile's line during the switch (restored on failure) so the
+  old and new SIM can no longer both show as enabled.
+
+- [Issue #27](https://github.com/MddIdd/mdd-sim-gateway/issues/27): pasted Hysteria2 and VLESS
+  nodes that other clients connect to could fail here with a generic "no healthy UDP-capable
+  node is ready". Share links now keep the parameters that were silently dropped — Hysteria2
+  obfuscation (`obfs`/`obfs-password`, without which the server discards every packet), an auth
+  string containing a colon, and `alpn` for protocols other than VLESS — and a link naming a
+  transport this gateway cannot render (grpc, httpupgrade, h2, quic) is refused by name instead
+  of being downgraded to a plain TCP outbound that never completes a handshake.
+
+- Country exit failures now say what actually went wrong: a disabled exit, a country-routing
+  master switch left off, and a host orchestrator that is not publishing status are reported
+  as themselves rather than as an unhealthy node pool. An exit whose sing-box refused to start
+  is no longer published as ready, and the node test surfaces what sing-box/Xray-core reported
+  instead of discarding it.
+
+## [1.5.4] - 2026-08-28
+
+### Fixed
+
+- Failed Issue analyses now leave a separate bounded notice even when the failed model Job cannot
+  expose its step outputs, while preserving the last successful analysis comment.
+
+- Fixed update-scope selection so “all versions” follows the approved latest Release while
+  “main versions only” can still install its independently configured stable Release by tag after
+  newer patches are published. The legacy promotion field remains synchronized so gateways older
+  than v1.5.4 can receive the approved patch.
+
+- [Issue #21](https://github.com/MddIdd/mdd-sim-gateway/issues/21): a VoWiFi health rebuild
+  could remove its failed container, sample the reader while its card identity was briefly
+  unavailable, and then erase the only automatic retry timer. A transient card-cache miss now
+  keeps a bounded eligibility retry, while an actual removal event or a disabled VoWiFi switch
+  still cancels recovery.
+
+- Redacted support bundles could retain operator-controlled proxy profile labels and node values,
+  the active exit-node label, and host interface addresses because those generic field names were
+  not sensitive outside their document context. Redaction now follows each field's path, hides
+  profile identifiers and references, and keeps the health evidence needed to diagnose a rebuild.
+
+## [1.5.3] - 2026-08-27
+
+### Changed
+
+- Official releases now provide native ARM64 and amd64 Engine and Control image assets. Fresh
+  installs from the official source archive and one-click upgrades download only the host's
+  architecture, verify its checksum and image identity, and avoid compiling Asterisk or Docker
+  control images on the gateway. Development checkouts retain an explicit source-build path.
+  Continuous integration now builds and validates the Engine natively on both architectures so
+  an architecture-specific packaging difference is caught before a release tag is created.
+
+- After moving an official installation to verified prebuilt images, the installer removes
+  dangling legacy Docker build cache left by earlier on-device builds. It uses the conservative
+  builder prune mode without `--all` and does not remove images, containers, or volumes.
+
+- Host diagnostics now show the filesystem's total, used and available space together with
+  separate MDD file, image, container-layer and shared Docker build-cache figures. System
+  maintenance can explicitly remove dangling builder records and reports the bytes reclaimed,
+  without deleting images, containers, volumes or reusable cache.
+
+- Administrators can explicitly remove unused old and rollback MDD images when disk space matters
+  more than one-click rollback. Current images, the trusted Engine base and every image referenced
+  by a container remain protected. The product overview now states the minimum free space,
+  recommended system-disk capacity and the need to expand a VM's root partition after its disk.
+
+### Fixed
+
+- The update dialog no longer truncates bilingual Release notes at 4,000 characters. It retains
+  a bounded 16,000-character response so important notices, patch changes and the current feature
+  release summary remain visible together.
+
+- Host storage diagnostics no longer present the sum of repeated Docker virtual image sizes as
+  physical MDD disk usage. They now show Docker's real layer-store total and independently report
+  the image and build-cache bytes Docker considers reclaimable. The maintenance button displays
+  its conservative build-cache estimate before confirmation. Build-cache cleanup no longer sends
+  Docker's unsupported `dangling` build/prune filter, and a daemon failure is returned as an
+  actionable error instead of a generic Internal Error.
+
+- Existing amd64 Docker-control installations on v1.4.x can now complete a direct v1.5.3
+  upgrade after the documented one-time mode-marker bootstrap. The target installer detects the
+  live Docker control plane, imports both verified amd64 Engine and Control assets through the
+  old updater's selected route, and restores the persisted Docker mode only after reload succeeds.
+  The bootstrap remains necessary because the immutable v1.4.x updater otherwise requests its
+  hard-coded ARM64 Control asset before any v1.5.3 code can run.
+
+- The navigation sidebar now follows Safari's dynamic viewport and provides native momentum
+  touch scrolling with bottom safe-area padding, so iPad users can reach version, repository and
+  sign-out controls instead of having the lower sidebar clipped behind browser chrome.
+
+- [Issue #17](https://github.com/MddIdd/mdd-sim-gateway/issues/17): cellular SMS sending
+  relied on an `mmcli` text-file option that is absent from ModemManager 1.20 on Ubuntu 22.04.
+  SMS objects are now created through ModemManager's stable D-Bus interface, preserving message
+  punctuation and Unicode without requiring a newer command-line client.
+
+- [Issue #18](https://github.com/MddIdd/mdd-sim-gateway/issues/18): ModemManager can report the
+  hexadecimal portion of an ICCID in uppercase while the saved PC/SC identity is lowercase.
+  Cellular SMS modem lookup and receive mapping now compare canonical case-insensitive ICCIDs.
+
+- [Issue #19](https://github.com/MddIdd/mdd-sim-gateway/issues/19): inserting a new SIM while
+  VoWiFi was disabled left its automatically discovered line permanently in draft state and
+  disabled the UI switch needed to recover it. Complete drafts are now promoted to usable line
+  records before the VoWiFi start policy is evaluated; the engine remains stopped until enabled.
+
+- [Issue #15](https://github.com/MddIdd/mdd-sim-gateway/issues/15): the v1.5.2 image cleanup
+  ran in the updater process copied from the installed version, so the first upgrade from an
+  older release could not execute the newly added cleanup. Cleanup now runs from the target
+  release's installer after a successful reload, making it effective on that first upgrade.
+
+- Superseded version tags in the MDD Control and Engine release repositories kept old images
+  from becoming dangling, so `docker image prune` alone could not enforce one-generation
+  rollback retention. Reload now removes only old MDD release-version tags before pruning,
+  while preserving the current version, `:previous`, the trusted Engine base, unrelated images,
+  and every image still referenced by a container.
+
+## [1.5.2] - 2026-08-26
+
+### Fixed
+
+- The sign-in screen laid out the “keep me signed in” checkbox above its label because the
+  generic form-label grid rule overrode the row layout. The checkbox and text now stay aligned
+  on one line.
+
+- [Issue #14](https://github.com/MddIdd/mdd-sim-gateway/issues/14): the 30-second status refresh
+  replaced a number-keeping form even while it contained unsaved edits. Polling now refreshes an
+  untouched form but leaves an active draft alone until it is saved or the row is closed.
+
+- [Issue #15](https://github.com/MddIdd/mdd-sim-gateway/issues/15): successful self-updates left
+  superseded untagged Docker images and obsolete build stages on the gateway. The updater now
+  prunes dangling images after services reload successfully, while retaining live images and the
+  explicitly tagged rollback image.
+
+## [1.5.1] - 2026-08-26
+
+### Fixed
+
+- The balance and allowance page told users with an unknown carrier query method to configure
+  it on the Messages page, even though that editor had moved away with the old Messages-page
+  integration. Query settings are now available directly on the balance and allowance card,
+  and attempting a query without a rule expands the editor in place.
+
+- [Issue #13](https://github.com/MddIdd/mdd-sim-gateway/issues/13): an amd64 host upgrading
+  from v1.4.1 downloaded the ARM64 Engine Release asset, then failed only after the source had
+  already been replaced because the imported image could not pass the host-architecture check.
+  Release image assets now remain ARM64-only by design, while amd64 upgrades skip them and refresh
+  or build native Engine and Docker-control images locally. The v1.4.1 handoff also overrides its
+  old `--no-engines` request on amd64 so the previous Engine cannot be left behind.
+
+- A locally preserved virtual environment whose `pip` launcher had lost its executable bit made
+  reload fail even though the Python interpreter and installed dependencies were healthy. Reload
+  now invokes pip through the virtual environment's interpreter, avoiding that unnecessary
+  dependency on the wrapper script's mode.
+
+## [1.5.0] - 2026-08-26
+
+### Added
+
+- Balance and number keeping, on one page. A carrier reclaims a number that never bills, and
+  nothing here tracked that: balance was buried on two other screens and activity was not
+  shown at all. The page answers whether each number is still on a network, still funded, and
+  whether anything is keeping it used — and can now keep it used, by producing one real
+  chargeable event on a schedule you set. A prepaid SIM sends a billed SMS; a plan SIM renews
+  itself and instead has its balance watched against the next cycle's fee. A free balance
+  lookup is not usage with most carriers and cannot stand in for either.
+
+  Lines whose SIM is not currently in the gateway are listed separately: they cannot be kept
+  alive, but they are the ones sitting unused, so their expiry is the most useful thing the
+  page can show. They can also be deleted there — ported-away numbers and old test entries
+  accumulate, and a line whose reader is absent could not be reached from the device page.
+
+- Voicemail. An incoming call nobody answers — which, for a SIM kept at home, usually means
+  no browser was open — now records the caller's message instead of ringing out into nothing.
+  Recordings play from the call log beside the call they belong to, and stay on the gateway:
+  they are never attached to a notification and never collected into a support bundle. Off by
+  default, with a per-line override, because recording a caller is the operator's decision
+  rather than something the product should assume. A call declined on the softphone is never
+  recorded.
+
+- Missed calls are announced. Until now the only call notification fired while the phone was
+  still ringing, which is the moment least useful to someone who is not at the browser. A
+  message left after the call replaces that notification rather than adding to it, so one
+  unanswered call cannot buzz a phone twice.
+
+- The control plane now checks releases in the background even when nobody is signed in and
+  can send a deduplicated new-version notice through the configured Webhook, Telegram and
+  PushPlus channels. Administrators can announce every release or only major/minor feature
+  updates, ignoring a patch-only change to the final version component.
+
+- Automatic updates are opt-in and use a separate promotion gate. Publishing a GitHub Release
+  does not authorize unattended installation: the exact latest version and its earliest rollout
+  time must also be approved in `update-policy.json`, allowing a release to soak before rollout.
+
+### Changed
+
+- Push notifications lead with the product name. A notification arrives out of context — on a
+  lock screen, or in a Telegram list beside a dozen other bots — where "未接来电" alone does
+  not say which machine is talking.
+
+- The Engine image now builds Asterisk, pjproject and pcsc-lite in a disposable build stage and
+  copies only their runtime closure into the image sent to the gateway. The ARM64 image is about
+  1.04 GB unpacked instead of 3.22 GB, while retaining the same 334 Asterisk module files; this
+  materially reduces release downloads and gateway system-disk use without narrowing the
+  supported codec or module surface.
+
+- Releases now build the Engine natively on an ARM64 GitHub runner from reviewed mirrors of the
+  pinned sysmocom commits and publish the same versioned image through GHCR and as a checksummed
+  Release asset. One-click update downloads that asset through the same direct-to-proxy fallback
+  as the rest of an update only when Engine inputs changed, verifies its architecture, version
+  and source fingerprints, preserves the previous image for rollback, then recreates only
+  affected lines.
+
+### Fixed
+
+- [Issue #10](https://github.com/MddIdd/mdd-sim-gateway/issues/10): two identical USB readers
+  without serial numbers could assign different live SIMs to the same Instance after reader names
+  changed across a reboot. Live card identity now decides attribution before the saved reader index
+  is refreshed, preserving the one-to-one mapping between SIMs and lines.
+
+- [Issue #12](https://github.com/MddIdd/mdd-sim-gateway/issues/12): recreating the Docker control
+  container during a self-update dropped the sing-box, xray and host-tool mounts used by network
+  exit tests. The installer now restores those mounts and their environment variables every time
+  it recreates the container.
+
+- Signing in again several times a day. Sessions were held in memory only, which reads as a
+  deliberate choice for an appliance until you count the restarts: replacing an Engine image,
+  reloading and every self-update restart the control plane, and each one logged every browser
+  out. Sessions now survive a restart, and the sign-in screen offers to keep the browser signed
+  in for 30 days instead of the 12-hour default. Only a hash of each token is stored, so the
+  file cannot be replayed as a cookie by anyone who can read it, and changing the password
+  still revokes every session everywhere.
+
+- Reloading an updated Engine image no longer leaves every replaced WiFi Calling line stopped.
+  After removing containers that still use the previous image, the installer now restarts only
+  the control plane so its initial reader scan brings each present SIM line back automatically;
+  Engine containers that were not replaced keep running.
+
+- Engine release builds no longer depend on `wget` completing Asterisk's sound downloads without
+  a deadline. Those small upstream assets now use bounded retries, low-speed detection and resume,
+  preventing a transient slow connection from leaving the ARM64 release job hung indefinitely.
+
+- A forced Engine source build had no way to override the reviewed GitHub source mirrors, so an
+  installation network that could reach the pinned upstream sysmocom repositories but not GitHub
+  failed before compilation began. The installer now passes explicitly configured pjproject and
+  Asterisk repository overrides into the Docker build while retaining the reviewed mirrors as the
+  safe default.
+
+- Four backend status messages appeared in English on a Chinese interface, including the one
+  shown when a reader holds another line's SIM — the sentence a user sees precisely when they
+  need to understand a binding mistake. The connectivity timeline could not label that state
+  at all and drew the raw code. Both tables are now checked against the backend by a test,
+  because a missing translation is invisible until someone reaches that exact state.
+
+### Removed
+
+- The 3/2/1-day activation reminder. Number keeping covers what it was for: a plan SIM now
+  reports a balance too low to renew, and every line's expiry is on the page with the same
+  countdown. It only ever fired for lines whose activation date had been filled in by hand.
+
+## [1.4.1] - 2026-08-22
+
+### Fixed
+
+- Dialling a carrier service code announced the wrong outcome while its answer was still on
+  its way. A code's verdict and its reply text reach the browser separately, and the screen
+  drew a conclusion from whichever arrived first — reporting that no reply was coming, or
+  that the code returns no text, a second before the text appeared. It now says it is waiting
+  until there is something to report, and distinguishes a code the carrier accepted (a reply
+  may follow) from one it refused (nothing more is coming).
+
+- The same screen could flip back and forth between outcomes. Every event refreshed the call
+  list, and those concurrent requests could return out of order, letting a stale response
+  overwrite a newer one — the result alternated between "waiting" and the answer. Refreshes
+  are now ordered so only the newest may take effect, and a verdict, once shown, is no longer
+  withdrawn.
+
+## [1.4.0] - 2026-08-22
+
+### Added
+
+- The dialler now accepts carrier service codes such as `*21*<number>#` (divert), `*#21#`
+  (check divert) and `#225#` (balance). Three separate layers rejected them before, each
+  looking like the last: the browser validated the input as either a short numeric code or an
+  E.164 number, JsSIP refused to build a request URI because `#` is not a legal user character
+  in a SIP URI, and the dialplan's outgoing extension pattern matched only `+` or a digit in
+  first position. All three now pass the code through untouched, escaping `#` for transport and
+  restoring it on the way out, so what reaches the network is what was dialled. What a code
+  then means is the carrier's IMS to decide, not this gateway's: supplementary-service codes
+  are the ones a TAS normally answers, whereas USSD codes need a USSI gateway the carrier may
+  no longer operate, and a carrier that has moved self-service into an app may simply decline.
+  Codes a handset answers by itself, currently `*#06#`, are answered from the line's own
+  provisioning instead of being dialled, since no network ever replies to those. Service codes
+  are refused on the cellular-modem transport rather than dialled as a voice call, which is all
+  that path can do; reaching them through a modem would need `AT+CUSD`, which is not built.
+
+- A dialled service code now reports whether the carrier served it. Because the code travels
+  as a call, the outcome used to arrive on a call's vocabulary — "declined", "no answer", a
+  running duration timer — none of which describe a request that is answered and torn down in
+  the same second, and all of which hide the one thing worth knowing: whether this carrier
+  supports the code at all. The Q.850 cause already reaching the control plane distinguishes
+  the cases, so codes are now scored on their own scale. An unknown code (404 Not Found),
+  a malformed one (484) and an unimplemented service (501/488) read as not supported; a 403
+  or 603 reads as refused, which is a different problem with a different fix — the request
+  reached the carrier and was declined by account policy rather than missing from the network.
+  Silence stays "no response" instead of being reported as unsupported, since nothing came
+  back to justify that claim.
+
+- A service code now shows what the carrier actually replied. The answer to `#225#` or `*#21#`
+  is not audio: the carrier puts it in the body of a SIP request inside the established dialog
+  — T-Mobile US uses the BYE — which is why such a "call" is silent and over in under a second.
+  That body was discarded, so an accepted code could confirm only that the carrier acted, never
+  what it said. The engine now copies the `application/vnd.3gpp.ussd+xml` payload onto the
+  channel and the control plane parses it (3GPP TS 24.390), storing the text with the call so
+  the balance or divert status appears where the code was dialled. The payload is bounded on
+  both sides — the engine refuses a body larger than 4 KB before copying it onto the stack, and
+  the parser caps the text it will store — and a body that is not decodable text is logged and
+  ignored rather than stored. Carriers that namespace the XML differently are handled; one that
+  returns no payload at all still reports the outcome as before.
+
+### Fixed
+
+- A line could retransmit forever against an exit connection that had already died. When the
+  exit is blamed but cannot be moved — strikes still short, pool exhausted, or the node pinned
+  — holding is the right call for node selection, but it used to leave one recoverable failure
+  unattended. sing-box keys a UDP session on its 5-tuple and retires it on an idle timer, and a
+  line rebuilding its tunnel refreshes that timer with every IKE retransmit: a session whose
+  outbound is dead is held open by the very retries meant to recover it, every later packet
+  goes to the same dead connection, no new session is ever created, and nothing is logged.
+  Rebuilding the container does not help, because it produces the same 5-tuple and lands on the
+  same dead session. Seen after a self-update restarted the orchestrator: two lines sharing the
+  only GB exit dialled before the route was up, got "no route to host", and stayed stuck for
+  twenty minutes while their tunnels reported CONNECTING and the exit itself tested fine. The
+  control plane now names the country when it blames an exit and declines to move it, and the
+  orchestrator closes that country's connections so the next packet has to dial afresh. This is
+  deliberately the weaker sibling of switching nodes: it changes no node, respects a pin, and
+  is gated on the same check, so an exit carrying a registered sibling line is never touched.
+
+- A service code beginning with `#` produced no call-log entry at all. The dialplan reports a
+  call through a shell, where an unquoted `#` at the start of a word opens a comment: dialling
+  `#225#` therefore discarded the number and every argument after it, and the record was never
+  created — not stuck in a wrong state, simply absent. `*#21#` was unaffected, its `#` falling
+  mid-word, which is why the failure looked arbitrary. The argument is now quoted.
+
+- A very short call could stay on "dialing" in the call log forever. The dialplan reports a
+  call's start and its outcome from separate backgrounded processes, so nothing orders the two:
+  when a call ends in under a second, the outcome can reach the manager before the record it is
+  meant to close, and it was then dropped silently — the call never left "dialing" even though
+  it had completed. A dialled service code answered on the BYE does exactly that, which is how
+  this surfaced, but the race was never specific to service codes and had been latent for any
+  short call. The outcome now waits briefly for the record it belongs to instead of being
+  discarded.
+
+- A SIM in an ordinary USB smart-card reader could report NO_CARD with the tunnel already up
+  (issue #8). A modem bridge presents one SIM on three logical slots so PIN keeping, tunnel
+  authentication and IMS-AKA can work independently; an ordinary reader has a single slot and
+  does all three through it. The engine contract nevertheless filled the unset slot numbers with
+  the modem layout, sending IMS-AKA to slot 2 — which on a one-reader gateway does not exist, so
+  the SIM read as absent while the same card answered the tunnel perfectly. Each role now
+  follows the reader the line is actually bound to, and the engine falls back to the only reader
+  present rather than refusing a slot number that names nothing. A modem line keeps its
+  dedicated channels. Gateways with two or more readers were unaffected: the stable USB-port
+  binding already resolved the right one there.
+
+- Learning a line's phone number no longer risks the connection it just made (issue #8). WiFi
+  Calling came up, held for a few seconds and was then torn down and re-established, with the
+  carrier answering "503 Service Unavailable" — the number was learned by enabling SIP tracing
+  and sending an extra REGISTER purely to produce a response that could be read, and some
+  carrier IMS cores decline an unsolicited re-registration seconds after accepting one. Asterisk
+  reports that as a rejected registration, and the health policy acts on rejections. The carrier
+  already announces the number in the registration the line makes anyway, so the engine now
+  records it from that response and the control plane reads it from the log: nothing extra is
+  sent, and SIP tracing — which also writes authentication headers into the container log — is
+  no longer switched on to ask a line for its own number. The same applies to the six-hourly
+  ported-number check. Every public identity the carrier lists is recorded, so a network that
+  puts an IMSI-derived identity ahead of the dialable number is read correctly. Requires a
+  rebuilt engine image; an older engine keeps a number already learned but cannot learn a new
+  one, which a manually entered number covers.
+
+- Binary SMS no longer appear in your conversations as walls of mojibake. Not every message is
+  meant for a person: carriers and services also send machine payloads — SIM data-download,
+  silent app pushes — whose content is arbitrary bytes rather than characters. The PDU says so
+  in its header, but Asterisk unpacks 8-bit data one byte per character and hands back a
+  string, so these landed in the message list looking like a text with a broken encoding, and
+  raised a notification each time. The engine now reports the message's TP-PID, TP-DCS, user
+  data header and raw PDU, and the control plane files anything that is 8-bit, addressed to the
+  SIM (message class 2) or marked as SIM data-download into a separate store instead of showing
+  it. Payloads already in the database are moved there on startup — nothing is discarded, and
+  the bytes are kept verbatim, since identifying an encrypted payload needs the PDU as it
+  arrived rather than a decode of it. Messages gains a collapsed "Non-text payloads" section
+  listing what was filed, with the reason it was filed and the raw bytes: the classification
+  reads the PDU header, so a carrier that mislabels a real text's data-coding scheme would
+  otherwise hide it for good with no way to notice. A rebuilt engine image is what supplies the
+  header fields; until then the control plane falls back to recognising a payload by its
+  content, which catches most but not all of them.
 
 ## [1.3.15] - 2026-08-20
 
